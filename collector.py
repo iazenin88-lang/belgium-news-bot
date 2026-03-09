@@ -52,9 +52,18 @@ def fingerprint(source_id: int, title: str, canonical_url: str) -> str:
 
 def extract_text_from_html(url: str) -> str | None:
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0"
-        }
+        article = Article(url)
+        article.download()
+        article.parse()
+        text = (article.text or "").strip()
+
+        if len(text) >= 200:
+            return text[:50000]
+    except Exception:
+        pass
+
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
         r = requests.get(url, timeout=20, headers=headers)
         r.raise_for_status()
     except Exception:
@@ -65,15 +74,15 @@ def extract_text_from_html(url: str) -> str | None:
     for tag in soup(["script", "style", "noscript", "header", "footer", "nav", "aside"]):
         tag.decompose()
 
-    article = soup.find("article")
-    if article:
-        text = article.get_text(" ", strip=True)
+    article_tag = soup.find("article")
+    if article_tag:
+        text = article_tag.get_text(" ", strip=True)
     else:
         text = soup.get_text(" ", strip=True)
 
     text = re.sub(r"\s+", " ", text).strip()
 
-    if len(text) < 300:
+    if len(text) < 100:
         return None
 
     return text[:50000]

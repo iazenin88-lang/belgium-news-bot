@@ -6,6 +6,7 @@ from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 import feedparser
 import requests
 from bs4 import BeautifulSoup
+from newspaper import Article
 from supabase import create_client
 
 

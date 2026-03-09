@@ -1,8 +1,6 @@
 name: Collect news
 
 on:
-  schedule:
-    - cron: "*/30 * * * *"
   workflow_dispatch:
 
 jobs:

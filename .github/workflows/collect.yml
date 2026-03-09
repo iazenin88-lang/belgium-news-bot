@@ -19,7 +19,7 @@ jobs:
 
       - name: Install libraries
         run: |
-          pip install feedparser supabase
+          pip install feedparser supabase requests beautifulsoup4
 
       - name: Run collector
         env:

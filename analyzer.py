@@ -139,13 +139,13 @@ def main():
     sb = get_supabase()
     oa = get_openai()
 
-    rows = (
-        sb.table("articles")
-        .select("id,title,summary,content,canonical_url,original_url,source_id,sources(name)")
-        .order("id", desc=False)
-        .limit(20)
-        .execute()
-    ).data or []
+   rows = (
+    sb.table("articles")
+    .select("*")
+    .order("id", desc=False)
+    .limit(20)
+    .execute()
+).data or []
 
     processed = 0
     skipped = 0

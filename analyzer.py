@@ -166,8 +166,7 @@ def main():
             skipped += 1
             continue
 
-        source_obj = row.get("sources")
-        source_name = source_obj.get("name") if isinstance(source_obj, dict) else None
+       source_name = "news"
 
         article = {
             "source_name": source_name,

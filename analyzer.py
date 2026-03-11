@@ -1,6 +1,5 @@
 import json
 import os
-from typing import Any
 
 from openai import OpenAI
 from supabase import create_client
@@ -58,7 +57,7 @@ URL: {url}
   "reason": "Коротко почему новость важна",
   "russian_summary": "Короткий пересказ на русском, 2-4 предложения.",
   "telegram_title": "Короткий заголовок",
-  "telegram_text": "Готовый короткий текст для Telegram на русском без markdown."
+  "telegram_text": "Готовый короткий текст для Telegram без markdown."
 }}
 """
 
@@ -74,33 +73,31 @@ def get_openai():
     return OpenAI(api_key=os.environ["OPENAI_API_KEY"])
 
 
-def pick_text(response: Any) -> str:
-    # Универсально пытаемся достать текст из Responses API ответа
+def pick_text(response) -> str:
     if hasattr(response, "output_text") and response.output_text:
         return response.output_text
 
-    # запасной путь
+    parts = []
     try:
-        parts = []
         for item in response.output:
             if getattr(item, "type", None) != "message":
                 continue
             for c in getattr(item, "content", []):
                 if getattr(c, "type", None) == "output_text":
                     parts.append(c.text)
-        return "\n".join(parts).strip()
     except Exception:
-        return ""
+        pass
+
+    return "\n".join(parts).strip()
 
 
-def analyze_article(client: OpenAI, article: dict[str, Any]) -> dict[str, Any]:
+def analyze_article(client, article):
     source_name = article.get("source_name") or "Unknown"
     title = article.get("title") or ""
     summary = article.get("summary") or ""
     content = article.get("content") or ""
     url = article.get("canonical_url") or article.get("original_url") or ""
 
-    # не шлём слишком много текста
     if len(content) > 12000:
         content = content[:12000]
 
@@ -127,7 +124,6 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> dict[str, Any]:
 
     data = json.loads(raw)
 
-    # базовая нормализация
     return {
         "is_relevant": bool(data.get("is_relevant", False)),
         "category": str(data.get("category", "other")),
@@ -143,16 +139,13 @@ def main():
     sb = get_supabase()
     oa = get_openai()
 
-    # Берём статьи, для которых ещё нет анализа
-    result = (
+    rows = (
         sb.table("articles")
         .select("id,title,summary,content,canonical_url,original_url,source_id,sources(name)")
-        .limit(20)
         .order("id", desc=False)
+        .limit(20)
         .execute()
-    )
-
-    rows = result.data or []
+    ).data or []
 
     processed = 0
     skipped = 0
@@ -174,25 +167,21 @@ def main():
             continue
 
         source_obj = row.get("sources")
-        if isinstance(source_obj, dict):
-            source_name = source_obj.get("name")
-        else:
-            source_name = None
+        source_name = source_obj.get("name") if isinstance(source_obj, dict) else None
 
         article = {
-            "id": article_id,
+            "source_name": source_name,
             "title": row.get("title"),
             "summary": row.get("summary"),
             "content": row.get("content"),
             "canonical_url": row.get("canonical_url"),
             "original_url": row.get("original_url"),
-            "source_name": source_name,
         }
 
         try:
             analysis = analyze_article(oa, article)
 
-            insert_row = {
+            sb.table("article_analysis").insert({
                 "article_id": article_id,
                 "is_relevant": analysis["is_relevant"],
                 "category": analysis["category"],
@@ -201,11 +190,9 @@ def main():
                 "russian_summary": analysis["russian_summary"],
                 "telegram_title": analysis["telegram_title"],
                 "telegram_text": analysis["telegram_text"],
-            }
+            }).execute()
 
-            sb.table("article_analysis").insert(insert_row).execute()
             processed += 1
-
         except Exception as e:
             print(f"ERROR article_id={article_id}: {e}")
             errors += 1

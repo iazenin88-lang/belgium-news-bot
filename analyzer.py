@@ -413,8 +413,7 @@ def main():
     result = (
         sb.table("articles")
         .select("*")
-        .order("id", desc=False)
-        .limit(20)
+       .order("id", desc=True).limit(20)
         .execute()
     )
 

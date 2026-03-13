@@ -1,27 +1,76 @@
+# Название workflow, которое будет отображаться в GitHub Actions
 name: Collect news
 
+# Триггеры запуска workflow
 on:
+
+  # Автоматический запуск по расписанию
+  schedule:
+
+    # Cron-выражение:
+    # 0,30 7-22 * * *
+    #
+    # означает:
+    # запуск в 00 и 30 минут
+    # каждого часа с 07:00 до 22:30
+    #
+    # То есть:
+    # 07:00
+    # 07:30
+    # 08:00
+    # ...
+    # 22:30
+    #
+    # Ночью workflow не запускается
+    - cron: "0,30 7-22 * * *"
+
+  # Позволяет запускать workflow вручную из интерфейса GitHub
   workflow_dispatch:
 
+# Описание задач workflow
 jobs:
+
+  # Имя задачи
   run:
+
+    # GitHub запускает задачу на виртуальной машине Ubuntu
     runs-on: ubuntu-latest
 
+    # Последовательность шагов выполнения
     steps:
+
+      # Шаг 1
+      # Клонирование репозитория в runner GitHub
       - uses: actions/checkout@v4
 
-      - name: Install python
+      # Шаг 2
+      # Установка Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
+
+          # Версия Python для выполнения скриптов
           python-version: "3.11"
 
+      # Шаг 3
+      # Установка библиотек Python, необходимых для работы collector.py
       - name: Install libraries
         run: |
           pip install feedparser supabase requests beautifulsoup4 newspaper3k lxml_html_clean
 
+      # Шаг 4
+      # Запуск скрипта сбора новостей
       - name: Run collector
+
+        # Передача секретов в переменные окружения
         env:
+
+          # URL проекта Supabase
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
+          # Service ключ Supabase (нужен для записи в базу)
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+        # Команда запуска Python скрипта
         run: |
           python collector.py

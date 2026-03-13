@@ -1,28 +1,74 @@
+# Название workflow
 name: Analyze news
 
+# Триггеры запуска
 on:
+
+  # Запуск по расписанию
+  schedule:
+
+    # Cron:
+    # 10,40 7-22 * * *
+    #
+    # Запуск:
+    # 07:10
+    # 07:40
+    # 08:10
+    # ...
+    # 22:40
+    #
+    # Анализ запускается через 10 минут после сбора,
+    # чтобы collector успел записать статьи в базу
+    - cron: "10,40 7-22 * * *"
+
+  # Возможность ручного запуска
   workflow_dispatch:
 
+# Определение задач workflow
 jobs:
+
   run:
+
+    # Используется стандартная виртуальная машина GitHub
     runs-on: ubuntu-latest
 
     steps:
+
+      # Шаг 1
+      # Клонирование репозитория
       - uses: actions/checkout@v4
 
+      # Шаг 2
+      # Установка Python
       - name: Install python
         uses: actions/setup-python@v5
         with:
+
+          # Версия Python
           python-version: "3.11"
 
+      # Шаг 3
+      # Установка библиотек для анализа новостей
       - name: Install libraries
         run: |
           pip install openai supabase
 
+      # Шаг 4
+      # Запуск AI-анализатора
       - name: Run analyzer
+
+        # Передача секретов
         env:
+
+          # Supabase проект
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
+          # ключ для доступа к базе
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+
+          # API ключ OpenAI
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+        # Запуск Python скрипта анализа
         run: |
           python analyzer.py

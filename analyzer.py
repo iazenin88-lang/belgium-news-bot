@@ -82,7 +82,6 @@ def get_openai():
 
 
 def pick_text(response: Any) -> str:
-    # Responses API often exposes output_text directly
     output_text = getattr(response, "output_text", None)
     if output_text:
         return output_text.strip()
@@ -146,7 +145,6 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> dict[str, Any]:
     if not raw:
         raise ValueError("Empty model response")
 
-    # If model wrapped JSON in ```json ... ```
     raw = raw.strip()
     if raw.startswith("```"):
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -164,13 +162,33 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def add_to_editor_queue(sb, article_id: int) -> None:
+    existing = (
+        sb.table("editor_queue")
+        .select("id")
+        .eq("article_id", article_id)
+        .limit(1)
+        .execute()
+    ).data
+
+    if existing:
+        print(f"Queue skip for article_id={article_id}: already in editor_queue")
+        return
+
+    sb.table("editor_queue").insert({
+        "article_id": article_id,
+        "status": "pending",
+    }).execute()
+
+    print(f"Added article_id={article_id} to editor_queue")
+
+
 def main():
     print("Starting analyzer...")
 
     sb = get_supabase()
     oa = get_openai()
 
-    # Берём статьи
     result = (
         sb.table("articles")
         .select("*")
@@ -184,7 +202,9 @@ def main():
 
     processed = 0
     skipped = 0
+    queued = 0
     errors = 0
+    quota_error = False
 
     for row in rows:
         article_id = row["id"]
@@ -214,7 +234,6 @@ def main():
 
         try:
             analysis = analyze_article(oa, article)
-            print(f"AI result for article_id={article_id}: relevant={analysis['is_relevant']}, category={analysis['category']}")
 
             insert_row = {
                 "article_id": article_id,
@@ -230,15 +249,32 @@ def main():
             sb.table("article_analysis").insert(insert_row).execute()
             processed += 1
 
+            print(
+                f"Saved analysis for article_id={article_id}: "
+                f"relevant={analysis['is_relevant']}, "
+                f"importance={analysis['importance_score']}, "
+                f"category={analysis['category']}"
+            )
+
+            if analysis["is_relevant"] and analysis["importance_score"] >= 6:
+                add_to_editor_queue(sb, article_id)
+                queued += 1
+
         except Exception as e:
-            print(f"ERROR article_id={article_id}: {repr(e)}")
+            error_text = repr(e)
+            print(f"ERROR article_id={article_id}: {error_text}")
             errors += 1
 
-    print(f"Done. processed={processed} skipped={skipped} errors={errors}")
+            if "insufficient_quota" in error_text or "RateLimitError" in error_text:
+                print("Stopping because OpenAI API quota/billing is not available.")
+                quota_error = True
+                break
 
-    # Не падаем всей job, чтобы увидеть логи
-    if processed == 0 and errors > 0:
-        raise RuntimeError("Analyzer finished with errors and processed 0 articles")
+    print(f"Done. processed={processed} skipped={skipped} queued={queued} errors={errors}")
+
+    if quota_error:
+        print("Analyzer stopped due to missing API quota. Add billing in platform.openai.com.")
+        return
 
 
 if __name__ == "__main__":

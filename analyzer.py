@@ -87,7 +87,6 @@ def pick_text(response: Any) -> str:
         return output_text.strip()
 
     parts: list[str] = []
-
     try:
         for item in getattr(response, "output", []) or []:
             if getattr(item, "type", None) != "message":
@@ -106,8 +105,7 @@ def pick_text(response: Any) -> str:
 def normalize_text(value: Any, max_len: int = 4000) -> str:
     if value is None:
         return ""
-    text = str(value).strip()
-    return text[:max_len]
+    return str(value).strip()[:max_len]
 
 
 def normalize_int(value: Any, default: int = 1) -> int:
@@ -162,7 +160,7 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def add_to_editor_queue(sb, article_id: int) -> None:
+def add_to_editor_queue(sb, article_id: int) -> bool:
     existing = (
         sb.table("editor_queue")
         .select("id")
@@ -173,7 +171,7 @@ def add_to_editor_queue(sb, article_id: int) -> None:
 
     if existing:
         print(f"Queue skip for article_id={article_id}: already in editor_queue")
-        return
+        return False
 
     sb.table("editor_queue").insert({
         "article_id": article_id,
@@ -181,6 +179,7 @@ def add_to_editor_queue(sb, article_id: int) -> None:
     }).execute()
 
     print(f"Added article_id={article_id} to editor_queue")
+    return True
 
 
 def main():
@@ -212,7 +211,7 @@ def main():
 
         existing = (
             sb.table("article_analysis")
-            .select("id")
+            .select("id,is_relevant,importance_score")
             .eq("article_id", article_id)
             .limit(1)
             .execute()
@@ -221,6 +220,11 @@ def main():
         if existing:
             print(f"Skip article_id={article_id}: already analyzed")
             skipped += 1
+
+            existing_row = existing[0]
+            if existing_row.get("is_relevant") and (existing_row.get("importance_score") or 0) >= 6:
+                if add_to_editor_queue(sb, article_id):
+                    queued += 1
             continue
 
         article = {
@@ -235,7 +239,7 @@ def main():
         try:
             analysis = analyze_article(oa, article)
 
-            insert_row = {
+            sb.table("article_analysis").insert({
                 "article_id": article_id,
                 "is_relevant": analysis["is_relevant"],
                 "category": analysis["category"],
@@ -244,9 +248,8 @@ def main():
                 "russian_summary": analysis["russian_summary"],
                 "telegram_title": analysis["telegram_title"],
                 "telegram_text": analysis["telegram_text"],
-            }
+            }).execute()
 
-            sb.table("article_analysis").insert(insert_row).execute()
             processed += 1
 
             print(
@@ -257,8 +260,8 @@ def main():
             )
 
             if analysis["is_relevant"] and analysis["importance_score"] >= 6:
-                add_to_editor_queue(sb, article_id)
-                queued += 1
+                if add_to_editor_queue(sb, article_id):
+                    queued += 1
 
         except Exception as e:
             error_text = repr(e)

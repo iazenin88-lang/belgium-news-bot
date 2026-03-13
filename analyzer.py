@@ -411,11 +411,12 @@ def main():
 
     # Берём максимум 20 статей за один запуск
     result = (
-        sb.table("articles")
-        .select("*")
-       .order("id", desc=True).limit(20)
-        .execute()
-    )
+    sb.table("articles")
+    .select("*")
+    .order("id", desc=True)
+    .limit(20)
+    .execute()
+)
 
     rows = result.data or []
     print(f"Loaded articles: {len(rows)}")

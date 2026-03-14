@@ -62,11 +62,14 @@ SYSTEM_PROMPT = """
 - новости соседних стран, если они реально влияют на жизнь людей в Бельгии
 - новости про Россию, россиян, русских, если они могут быть значимы
   для русскоязычной аудитории в Бельгии
+- отдельные темы развлечений, если они реально заметны для русскоязычной аудитории в Бельгии
+  или имеют практический/общественный контекст
 
 Считать нерелевантными:
 - обычные мировые новости без практической связи с жизнью в Бельгии
-- спорт, шоу-бизнес, криминальные мелочи, если нет практической пользы
+- спорт, криминальные мелочи, если нет практической пользы
 - локальные мелочи без заметного влияния на читателей
+- развлекательные новости низкой значимости без общественного или практического смысла
 
 Категории используй только из списка:
 migration, housing, work, taxes, transport, education, healthcare, social, politics, safety, europe, other
@@ -100,31 +103,28 @@ URL: {url}
 # Ключевые слова для pre-filter
 # -------------------------------------------------------
 
-# Слова/темы, которые почти всегда являются шумом для этого проекта
+# Явный шум, который почти никогда не нужен
+# ВАЖНО: entertainment здесь НЕ удаляется специально, по твоему запросу
 HARD_REJECT_KEYWORDS = {
     "football", "soccer", "champions league", "premier league", "uefa",
     "basketball", "tennis tournament", "formula 1", "motogp",
-    "celebrity", "celebrities", "showbiz", "entertainment", "movie star",
-    "red carpet", "fashion week", "influencer", "tiktok star",
+    "movie star", "red carpet", "fashion week",
     "album release", "box office", "love island",
     "royal gossip", "tv show", "reality show",
     "transfer rumor", "match preview", "match report", "line-up",
     "livestream sports", "sports betting",
 }
 
-# Слова, которые делают статью потенциально интересной для AI-анализа
+# Общие ключевые слова релевантности
 PASS_KEYWORDS = {
-    # Бельгия / регионы
+    # Бельгия / регионы / города
     "belgium", "belgian", "brussels", "flanders", "wallonia", "antwerp", "ghent",
     "belgië", "brussel", "vlaanderen", "wallonië", "gent", "antwerpen",
 
-    # ЕС / соседи
-    "eu", "european union", "europe", "netherlands", "france", "germany", "luxembourg",
-
-    # миграция / статус / приезжие
+    # миграция / статус / документы
     "visa", "residence permit", "permit", "asylum", "refugee", "refugees",
     "migrant", "migrants", "immigration", "integration", "expat", "foreign worker",
-    "ukrainian", "ukrainians", "temporary protection",
+    "temporary protection", "residency", "residence card",
 
     # жильё / работа / деньги
     "housing", "rent", "rental", "landlord", "tenant", "mortgage",
@@ -136,17 +136,26 @@ PASS_KEYWORDS = {
     "healthcare", "hospital", "doctor", "medicine", "insurance",
     "safety", "police", "court", "law", "legal",
 
+    # Украина / беженцы
+    "ukrainian", "ukrainians", "ukraine",
+
     # Россия / русскоязычная аудитория
     "russia", "russian", "russians",
     "россия", "россияне", "русские", "русский",
+
+    # entertainment оставляем как допустимую тему
+    "entertainment", "festival", "concert", "cinema", "music", "cultural event",
+    "culture", "event", "events",
 }
 
-# Слова, которые усиливают практическую важность
+# Сильные practical / общественные сигналы
 HIGH_SIGNAL_KEYWORDS = {
-    "new law", "law", "rules", "policy", "ban", "decision", "court", "tax",
-    "visa", "permit", "pension", "housing", "rent", "transport", "strike",
-    "school", "benefits", "immigration", "refugee", "asylum", "healthcare",
-    "sanctions", "customs", "border", "residence",
+    "new law", "law", "rules", "policy", "ban", "decision", "court",
+    "tax", "taxes", "visa", "permit", "pension", "housing", "rent",
+    "transport", "strike", "school", "benefits", "immigration",
+    "refugee", "refugees", "asylum", "healthcare", "insurance",
+    "border", "customs", "residence", "residency", "work permit",
+    "salary", "wage", "unemployment", "education", "police", "safety",
 }
 
 
@@ -245,15 +254,16 @@ def count_matches(text: str, keywords: set[str]) -> int:
 
 
 # -------------------------------------------------------
-# Дешёвый pre-filter перед OpenAI
+# Более строгий pre-filter перед OpenAI
 # -------------------------------------------------------
 def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     """
-    Решает, стоит ли вообще отправлять статью в OpenAI.
+    Более строгий pre-filter перед OpenAI.
 
-    Возвращает:
-    - bool: отправлять ли в AI
-    - str: краткая причина решения
+    Логика:
+    1. Сразу режем явный мусор
+    2. Требуем либо практическую тему, либо сочетание нескольких сильных сигналов
+    3. Пограничные случаи без достаточного контекста режем
     """
     title = normalize_text(article.get("title"), 1000)
     summary = normalize_text(article.get("summary"), 4000)
@@ -262,31 +272,115 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     combined = f"{title}\n{summary}\n{content}".strip()
     combined_lower = combined.lower()
 
-    # Если совсем нет текста — нет смысла тратить AI
+    # Нет текста вообще — сразу reject
     if not title and not summary and not content:
         return False, "Нет заголовка, summary и content"
 
-    # Если статья явно относится к шумным тематикам — сразу отбрасываем
+    # Явный шум — сразу reject
     if contains_any(combined_lower, HARD_REJECT_KEYWORDS):
-        return False, "Явно нерелевантная тема (спорт/шоу-бизнес и т.п.)"
+        return False, "Явно нерелевантная тема (спорт и т.п.)"
 
-    # Если есть выраженные сигналы релевантности — отправляем в AI
     pass_matches = count_matches(combined_lower, PASS_KEYWORDS)
     high_signal_matches = count_matches(combined_lower, HIGH_SIGNAL_KEYWORDS)
 
-    if pass_matches >= 1:
-        return True, "Есть ключевые слова релевантности"
+    summary_len = len(summary)
+    content_len = len(content)
 
-    if high_signal_matches >= 2:
-        return True, "Есть сильные сигналы важной новости"
+    # -----------------------------
+    # 1. Сильные practical темы
+    # -----------------------------
+    practical_keywords = {
+        "visa", "permit", "residence permit", "asylum", "refugee", "migrant",
+        "housing", "rent", "tenant", "landlord", "salary", "wage", "employment",
+        "tax", "taxes", "pension", "benefit", "benefits",
+        "school", "education", "transport", "train", "tram", "bus",
+        "healthcare", "hospital", "insurance", "doctor",
+        "police", "court", "law", "legal", "safety",
+        "temporary protection", "work permit",
+    }
 
-    # Если summary или content совсем короткие, а ключевых слов нет — скорее шум
-    if len(summary) < 40 and len(content) < 120 and pass_matches == 0:
+    practical_matches = count_matches(combined_lower, practical_keywords)
+
+    if practical_matches >= 1 and (summary_len >= 80 or content_len >= 250):
+        return True, "Есть practical-тема и достаточно содержательный текст"
+
+    # -----------------------------
+    # 2. Темы про Россию / русских / россиян
+    # -----------------------------
+    russia_keywords = {
+        "russia", "russian", "russians",
+        "россия", "россияне", "русские", "русский",
+    }
+    russia_matches = count_matches(combined_lower, russia_keywords)
+
+    if russia_matches >= 1:
+        if practical_matches >= 1:
+            return True, "Россия/русские + practical-контекст"
+        if high_signal_matches >= 2 and (summary_len >= 80 or content_len >= 250):
+            return True, "Россия/русские + сильный новостной контекст"
+
+    # -----------------------------
+    # 3. Бельгийский контекст
+    # -----------------------------
+    belgium_keywords = {
+        "belgium", "belgian", "brussels", "flanders", "wallonia", "antwerp", "ghent",
+        "belgië", "brussel", "vlaanderen", "wallonië", "gent", "antwerpen",
+    }
+    belgium_matches = count_matches(combined_lower, belgium_keywords)
+
+    if belgium_matches >= 1 and (practical_matches >= 1 or high_signal_matches >= 2):
+        return True, "Бельгийский контекст + практическая или сильная тема"
+
+    # -----------------------------
+    # 4. Европа / соседи
+    # -----------------------------
+    europe_keywords = {
+        "eu", "european union", "europe",
+        "netherlands", "france", "germany", "luxembourg",
+    }
+    europe_matches = count_matches(combined_lower, europe_keywords)
+
+    if europe_matches >= 1 and practical_matches >= 1 and (summary_len >= 80 or content_len >= 250):
+        return True, "Европейский контекст с practical-углом"
+
+    # -----------------------------
+    # 5. Entertainment / culture
+    # Оставляем проход, но только при наличии контекста
+    # -----------------------------
+    entertainment_keywords = {
+        "entertainment", "festival", "concert", "cinema", "music",
+        "cultural event", "culture", "event", "events",
+    }
+    entertainment_matches = count_matches(combined_lower, entertainment_keywords)
+
+    if entertainment_matches >= 1:
+        if belgium_matches >= 1 and (summary_len >= 80 or content_len >= 250):
+            return True, "Развлекательная тема с бельгийским контекстом"
+        if high_signal_matches >= 2 and (summary_len >= 100 or content_len >= 300):
+            return True, "Развлекательная тема с сильным общественным контекстом"
+
+    # -----------------------------
+    # 6. Общий сильный случай
+    # -----------------------------
+    if high_signal_matches >= 3 and (summary_len >= 100 or content_len >= 300):
+        return True, "Несколько сильных сигналов и содержательный текст"
+
+    # -----------------------------
+    # 7. Слишком короткие и слабые статьи режем
+    # -----------------------------
+    if summary_len < 60 and content_len < 180:
         return False, "Слишком мало содержательной информации"
 
-    # По умолчанию пограничные случаи всё равно отправляем в AI,
-    # чтобы не потерять потенциально важную статью
-    return True, "Пограничный случай — отправляем в AI"
+    # -----------------------------
+    # 8. Один слабый сигнал — недостаточно
+    # -----------------------------
+    if pass_matches <= 1 and high_signal_matches <= 1 and practical_matches == 0:
+        return False, "Недостаточно сигналов релевантности"
+
+    # -----------------------------
+    # 9. Пограничные статьи режем жёстче
+    # -----------------------------
+    return False, "Пограничный случай без достаточных оснований для AI"
 
 
 # -------------------------------------------------------
@@ -324,7 +418,6 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> dict[str, Any]:
 
     raw = raw.strip()
 
-    # Если модель завернула JSON в markdown-блок
     if raw.startswith("```"):
         raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
@@ -409,14 +502,14 @@ def main():
     sb = get_supabase()
     oa = get_openai()
 
-    # Берём максимум 20 статей за один запуск
+    # Берём самые новые статьи за запуск
     result = (
-    sb.table("articles")
-    .select("*")
-    .order("id", desc=True)
-    .limit(20)
-    .execute()
-)
+        sb.table("articles")
+        .select("*")
+        .order("id", desc=True)
+        .limit(20)
+        .execute()
+    )
 
     rows = result.data or []
     print(f"Loaded articles: {len(rows)}")
@@ -424,7 +517,7 @@ def main():
     processed = 0
     skipped = 0
     queued = 0
-    prefiler_rejected = 0
+    prefilter_rejected = 0
     errors = 0
     quota_error = False
 
@@ -432,7 +525,6 @@ def main():
         article_id = row["id"]
         print(f"Processing article_id={article_id}")
 
-        # Проверяем, не анализировали ли уже эту статью
         existing = (
             sb.table("article_analysis")
             .select("id,is_relevant,importance_score")
@@ -462,18 +554,16 @@ def main():
         }
 
         try:
-            # Сначала дешёвый pre-filter
             send_to_ai, prefilter_reason = should_send_to_ai(article)
 
             if not send_to_ai:
                 save_prefilter_rejection(sb, article_id, prefilter_reason)
-                prefiler_rejected += 1
+                prefilter_rejected += 1
                 processed += 1
                 continue
 
             print(f"Sending article_id={article_id} to AI: {prefilter_reason}")
 
-            # Только теперь тратим OpenAI
             analysis = analyze_article(oa, article)
 
             sb.table("article_analysis").insert({
@@ -512,7 +602,7 @@ def main():
 
     print(
         f"Done. processed={processed} skipped={skipped} "
-        f"queued={queued} prefilter_rejected={prefiler_rejected} errors={errors}"
+        f"queued={queued} prefilter_rejected={prefilter_rejected} errors={errors}"
     )
 
     if quota_error:

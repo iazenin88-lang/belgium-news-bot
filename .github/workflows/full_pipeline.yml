@@ -1,0 +1,87 @@
+# -------------------------------------------------------
+# Workflow: Full news pipeline
+#
+# Что делает:
+# 1. Собирает новые статьи
+# 2. Анализирует их через pre-filter + OpenAI
+# 3. Отправляет кандидаты редактору в Telegram
+#
+# Зачем нужен:
+# - один запуск вместо трёх ручных
+# - гарантированный порядок шагов
+# - следующий шаг стартует только после успешного завершения предыдущего
+# -------------------------------------------------------
+
+name: Full news pipeline
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # каждые 30 минут с 07:00 до 22:30
+    - cron: "0,30 7-22 * * *"
+
+jobs:
+  run:
+    # Используем стандартный GitHub runner
+    runs-on: ubuntu-latest
+
+    steps:
+      # -------------------------------------------------
+      # Шаг 1. Забираем код из репозитория
+      # -------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------
+      # Шаг 2. Устанавливаем Python
+      # -------------------------------------------------
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # -------------------------------------------------
+      # Шаг 3. Устанавливаем зависимости
+      # -------------------------------------------------
+      - name: Install dependencies
+        run: |
+          pip install openai supabase requests feedparser beautifulsoup4 lxml
+
+      # -------------------------------------------------
+      # Шаг 4. Запускаем collector
+      # Если этот шаг упадёт, дальше workflow не пойдёт
+      # -------------------------------------------------
+      - name: Run collector
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: |
+          python collector.py
+
+      # -------------------------------------------------
+      # Шаг 5. Запускаем analyzer
+      # Стартует только после успешного collector
+      # -------------------------------------------------
+      - name: Run analyzer
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python analyzer.py
+
+      # -------------------------------------------------
+      # Шаг 6. Запускаем notifier
+      # Стартует только после успешного analyzer
+      # -------------------------------------------------
+      - name: Run notifier
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python notifier.py

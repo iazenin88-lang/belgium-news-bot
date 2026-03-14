@@ -1,0 +1,38 @@
+# -------------------------------------------------------
+# Workflow: Daily OpenAI balance report
+# Отправляет ежедневный отчёт в 07:00
+# -------------------------------------------------------
+
+name: Daily OpenAI balance report
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    # каждый день в 07:00
+    - cron: "0 7 * * *"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install libraries
+        run: |
+          pip install supabase requests
+
+      - name: Run daily balance report
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python balance_report.py

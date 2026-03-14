@@ -4,28 +4,25 @@ analyzer.py
 Назначение:
 анализирует новые статьи из таблицы articles и сохраняет результат в article_analysis.
 
-Логика работы:
-1. Берём статьи из articles
-2. Если статья уже анализировалась:
-   - пропускаем повторный AI-анализ
-   - при необходимости добавляем её в editor_queue
-3. Если статья новая:
-   - сначала запускаем дешёвый pre-filter без OpenAI
-   - если статья явно нерелевантна, сразу записываем это в article_analysis
-   - если статья потенциально интересна, отправляем её в OpenAI
-4. Если AI считает статью релевантной и importance_score >= 6,
-   добавляем её в editor_queue
+Дополнительно:
+- считает стоимость OpenAI за текущий прогон
+- пишет статистику в ai_runs
+- обновляет ai_balance
+- после прогона отправляет в Telegram сообщение о расходах
 
-Зачем нужен pre-filter:
-- уменьшает число вызовов OpenAI
-- снижает стоимость
-- отбрасывает очевидный шум ещё до AI
+Важно:
+- стоимость считается по заданным в коде тарифам
+- остаток баланса является оценочным:
+    remaining = starting_balance_usd - spent_total_usd
 """
 
 import json
 import os
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
+import requests
 from openai import OpenAI
 from supabase import create_client
 
@@ -34,6 +31,23 @@ from supabase import create_client
 # Модель OpenAI
 # -------------------------------------------------------
 MODEL = "gpt-5-mini"
+
+
+# -------------------------------------------------------
+# Тарифы модели
+#
+# ВАЖНО:
+# при необходимости поменяй вручную под актуальные цены.
+# Значения ниже задаются в долларах за 1 миллион токенов.
+# -------------------------------------------------------
+INPUT_COST_PER_1M = Decimal("0.250000")
+OUTPUT_COST_PER_1M = Decimal("2.000000")
+
+
+# -------------------------------------------------------
+# Telegram
+# -------------------------------------------------------
+TELEGRAM_API_BASE = "https://api.telegram.org"
 
 
 # -------------------------------------------------------
@@ -102,9 +116,6 @@ URL: {url}
 # -------------------------------------------------------
 # Ключевые слова для pre-filter
 # -------------------------------------------------------
-
-# Явный шум, который почти никогда не нужен
-# ВАЖНО: entertainment здесь НЕ удаляется специально, по твоему запросу
 HARD_REJECT_KEYWORDS = {
     "football", "soccer", "champions league", "premier league", "uefa",
     "basketball", "tennis tournament", "formula 1", "motogp",
@@ -115,40 +126,31 @@ HARD_REJECT_KEYWORDS = {
     "livestream sports", "sports betting",
 }
 
-# Общие ключевые слова релевантности
 PASS_KEYWORDS = {
-    # Бельгия / регионы / города
     "belgium", "belgian", "brussels", "flanders", "wallonia", "antwerp", "ghent",
     "belgië", "brussel", "vlaanderen", "wallonië", "gent", "antwerpen",
 
-    # миграция / статус / документы
     "visa", "residence permit", "permit", "asylum", "refugee", "refugees",
     "migrant", "migrants", "immigration", "integration", "expat", "foreign worker",
     "temporary protection", "residency", "residence card",
 
-    # жильё / работа / деньги
     "housing", "rent", "rental", "landlord", "tenant", "mortgage",
     "salary", "wage", "employment", "job market", "unemployment",
     "tax", "taxes", "benefit", "benefits", "pension", "allowance",
 
-    # быт
     "school", "education", "transport", "rail", "train", "tram", "bus",
     "healthcare", "hospital", "doctor", "medicine", "insurance",
     "safety", "police", "court", "law", "legal",
 
-    # Украина / беженцы
     "ukrainian", "ukrainians", "ukraine",
 
-    # Россия / русскоязычная аудитория
     "russia", "russian", "russians",
     "россия", "россияне", "русские", "русский",
 
-    # entertainment оставляем как допустимую тему
     "entertainment", "festival", "concert", "cinema", "music", "cultural event",
     "culture", "event", "events",
 }
 
-# Сильные practical / общественные сигналы
 HIGH_SIGNAL_KEYWORDS = {
     "new law", "law", "rules", "policy", "ban", "decision", "court",
     "tax", "taxes", "visa", "permit", "pension", "housing", "rent",
@@ -162,15 +164,14 @@ HIGH_SIGNAL_KEYWORDS = {
 # -------------------------------------------------------
 # Вспомогательные функции
 # -------------------------------------------------------
-def get_env(name: str) -> str:
+def get_env(name: str, required: bool = True) -> str:
     """
     Получает переменную окружения.
-    Если переменная не задана — бросаем ошибку.
     """
     value = os.environ.get(name)
-    if not value:
+    if required and not value:
         raise RuntimeError(f"Missing environment variable: {name}")
-    return value
+    return value or ""
 
 
 def get_supabase():
@@ -253,17 +254,47 @@ def count_matches(text: str, keywords: set[str]) -> int:
     return sum(1 for keyword in keywords if keyword in text_lower)
 
 
+def quantize_money(value: Decimal) -> Decimal:
+    """
+    Округляет денежное значение до 6 знаков после запятой.
+    """
+    return value.quantize(Decimal("0.000001"), rounding=ROUND_HALF_UP)
+
+
+def now_iso() -> str:
+    """
+    Возвращает текущее время в ISO UTC.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
+# -------------------------------------------------------
+# Telegram helper
+# -------------------------------------------------------
+def telegram_send_message(bot_token: str, chat_id: str, text: str) -> None:
+    """
+    Отправляет сообщение в Telegram.
+    """
+    url = f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage"
+
+    response = requests.post(
+        url,
+        json={
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+
 # -------------------------------------------------------
 # Более строгий pre-filter перед OpenAI
 # -------------------------------------------------------
 def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     """
     Более строгий pre-filter перед OpenAI.
-
-    Логика:
-    1. Сразу режем явный мусор
-    2. Требуем либо практическую тему, либо сочетание нескольких сильных сигналов
-    3. Пограничные случаи без достаточного контекста режем
     """
     title = normalize_text(article.get("title"), 1000)
     summary = normalize_text(article.get("summary"), 4000)
@@ -272,11 +303,9 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     combined = f"{title}\n{summary}\n{content}".strip()
     combined_lower = combined.lower()
 
-    # Нет текста вообще — сразу reject
     if not title and not summary and not content:
         return False, "Нет заголовка, summary и content"
 
-    # Явный шум — сразу reject
     if contains_any(combined_lower, HARD_REJECT_KEYWORDS):
         return False, "Явно нерелевантная тема (спорт и т.п.)"
 
@@ -286,9 +315,6 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     summary_len = len(summary)
     content_len = len(content)
 
-    # -----------------------------
-    # 1. Сильные practical темы
-    # -----------------------------
     practical_keywords = {
         "visa", "permit", "residence permit", "asylum", "refugee", "migrant",
         "housing", "rent", "tenant", "landlord", "salary", "wage", "employment",
@@ -304,9 +330,6 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     if practical_matches >= 1 and (summary_len >= 80 or content_len >= 250):
         return True, "Есть practical-тема и достаточно содержательный текст"
 
-    # -----------------------------
-    # 2. Темы про Россию / русских / россиян
-    # -----------------------------
     russia_keywords = {
         "russia", "russian", "russians",
         "россия", "россияне", "русские", "русский",
@@ -319,9 +342,6 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
         if high_signal_matches >= 2 and (summary_len >= 80 or content_len >= 250):
             return True, "Россия/русские + сильный новостной контекст"
 
-    # -----------------------------
-    # 3. Бельгийский контекст
-    # -----------------------------
     belgium_keywords = {
         "belgium", "belgian", "brussels", "flanders", "wallonia", "antwerp", "ghent",
         "belgië", "brussel", "vlaanderen", "wallonië", "gent", "antwerpen",
@@ -331,9 +351,6 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     if belgium_matches >= 1 and (practical_matches >= 1 or high_signal_matches >= 2):
         return True, "Бельгийский контекст + практическая или сильная тема"
 
-    # -----------------------------
-    # 4. Европа / соседи
-    # -----------------------------
     europe_keywords = {
         "eu", "european union", "europe",
         "netherlands", "france", "germany", "luxembourg",
@@ -343,10 +360,6 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     if europe_matches >= 1 and practical_matches >= 1 and (summary_len >= 80 or content_len >= 250):
         return True, "Европейский контекст с practical-углом"
 
-    # -----------------------------
-    # 5. Entertainment / culture
-    # Оставляем проход, но только при наличии контекста
-    # -----------------------------
     entertainment_keywords = {
         "entertainment", "festival", "concert", "cinema", "music",
         "cultural event", "culture", "event", "events",
@@ -359,36 +372,55 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
         if high_signal_matches >= 2 and (summary_len >= 100 or content_len >= 300):
             return True, "Развлекательная тема с сильным общественным контекстом"
 
-    # -----------------------------
-    # 6. Общий сильный случай
-    # -----------------------------
     if high_signal_matches >= 3 and (summary_len >= 100 or content_len >= 300):
         return True, "Несколько сильных сигналов и содержательный текст"
 
-    # -----------------------------
-    # 7. Слишком короткие и слабые статьи режем
-    # -----------------------------
     if summary_len < 60 and content_len < 180:
         return False, "Слишком мало содержательной информации"
 
-    # -----------------------------
-    # 8. Один слабый сигнал — недостаточно
-    # -----------------------------
     if pass_matches <= 1 and high_signal_matches <= 1 and practical_matches == 0:
         return False, "Недостаточно сигналов релевантности"
 
-    # -----------------------------
-    # 9. Пограничные статьи режем жёстче
-    # -----------------------------
     return False, "Пограничный случай без достаточных оснований для AI"
+
+
+# -------------------------------------------------------
+# Считаем стоимость OpenAI-вызова
+# -------------------------------------------------------
+def extract_usage_tokens(response: Any) -> tuple[int, int]:
+    """
+    Пытается достать input/output tokens из ответа OpenAI.
+    """
+    input_tokens = 0
+    output_tokens = 0
+
+    usage = getattr(response, "usage", None)
+    if usage:
+        input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+
+    return input_tokens, output_tokens
+
+
+def calc_cost_usd(input_tokens: int, output_tokens: int) -> Decimal:
+    """
+    Считает стоимость запроса в долларах.
+    """
+    input_cost = (Decimal(input_tokens) / Decimal("1000000")) * INPUT_COST_PER_1M
+    output_cost = (Decimal(output_tokens) / Decimal("1000000")) * OUTPUT_COST_PER_1M
+    return quantize_money(input_cost + output_cost)
 
 
 # -------------------------------------------------------
 # Вызов OpenAI
 # -------------------------------------------------------
-def analyze_article(client: OpenAI, article: dict[str, Any]) -> dict[str, Any]:
+def analyze_article(client: OpenAI, article: dict[str, Any]) -> tuple[dict[str, Any], int, int, Decimal]:
     """
-    Отправляет статью в OpenAI и получает структурированный анализ.
+    Отправляет статью в OpenAI и получает:
+    - анализ
+    - input tokens
+    - output tokens
+    - стоимость запроса
     """
     source_name = normalize_text(article.get("source_name"), 200) or "news"
     title = normalize_text(article.get("title"), 1000)
@@ -423,7 +455,10 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> dict[str, Any]:
 
     data = json.loads(raw)
 
-    return {
+    input_tokens, output_tokens = extract_usage_tokens(response)
+    cost_usd = calc_cost_usd(input_tokens, output_tokens)
+
+    analysis = {
         "is_relevant": bool(data.get("is_relevant", False)),
         "category": normalize_text(data.get("category", "other"), 100),
         "importance_score": normalize_int(data.get("importance_score", 1)),
@@ -433,6 +468,8 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> dict[str, Any]:
         "telegram_text": normalize_text(data.get("telegram_text", ""), 4000),
     }
 
+    return analysis, input_tokens, output_tokens, cost_usd
+
 
 # -------------------------------------------------------
 # Добавление статьи в очередь редактора
@@ -440,8 +477,6 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> dict[str, Any]:
 def add_to_editor_queue(sb, article_id: int) -> bool:
     """
     Добавляет статью в editor_queue, если её там ещё нет.
-
-    Возвращает True, если запись была добавлена.
     """
     existing = (
         sb.table("editor_queue")
@@ -486,6 +521,103 @@ def save_prefilter_rejection(sb, article_id: int, reason: str) -> None:
 
 
 # -------------------------------------------------------
+# Работа с ai_runs / ai_balance
+# -------------------------------------------------------
+def create_ai_run(sb) -> int:
+    """
+    Создаёт запись нового прогона и возвращает run_id.
+    """
+    result = sb.table("ai_runs").insert({
+        "run_type": "analyze",
+        "started_at": now_iso(),
+    }).execute()
+
+    row = result.data[0]
+    return row["id"]
+
+
+def finish_ai_run(
+    sb,
+    run_id: int,
+    processed: int,
+    skipped: int,
+    queued: int,
+    prefilter_rejected: int,
+    ai_calls: int,
+    input_tokens: int,
+    output_tokens: int,
+    cost_usd: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """
+    Завершает прогон, пишет статистику и обновляет ai_balance.
+
+    Возвращает:
+    - starting_balance_usd
+    - spent_total_usd
+    - remaining_estimated_usd
+    """
+    sb.table("ai_runs").update({
+        "finished_at": now_iso(),
+        "processed_count": processed,
+        "skipped_count": skipped,
+        "queued_count": queued,
+        "prefilter_rejected_count": prefilter_rejected,
+        "ai_calls_count": ai_calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cost_usd": str(cost_usd),
+    }).eq("id", run_id).execute()
+
+    balance_rows = (
+        sb.table("ai_balance")
+        .select("*")
+        .eq("id", 1)
+        .limit(1)
+        .execute()
+    ).data or []
+
+    if not balance_rows:
+        raise RuntimeError("ai_balance row with id=1 not found")
+
+    balance = balance_rows[0]
+    starting_balance = Decimal(str(balance["starting_balance_usd"]))
+    spent_total_old = Decimal(str(balance["spent_total_usd"]))
+    spent_total_new = quantize_money(spent_total_old + cost_usd)
+    remaining = quantize_money(starting_balance - spent_total_new)
+
+    sb.table("ai_balance").update({
+        "spent_total_usd": str(spent_total_new),
+        "updated_at": now_iso(),
+    }).eq("id", 1).execute()
+
+    return starting_balance, spent_total_new, remaining
+
+
+def send_run_balance_message(
+    bot_token: str,
+    chat_id: str,
+    run_cost_usd: Decimal,
+    spent_total_usd: Decimal,
+    remaining_estimated_usd: Decimal,
+    ai_calls: int,
+    prefilter_rejected: int,
+) -> None:
+    """
+    Отправляет Telegram-сообщение после прогона analyzer.
+    """
+    text = (
+        "📊 OpenAI balance update\n\n"
+        f"Last run cost: ${run_cost_usd}\n"
+        f"Spent total: ${spent_total_usd}\n"
+        f"Estimated remaining: ${remaining_estimated_usd}\n\n"
+        f"AI calls this run: {ai_calls}\n"
+        f"Pre-filter rejected: {prefilter_rejected}"
+    )
+
+    telegram_send_message(bot_token, chat_id, text)
+
+
+# -------------------------------------------------------
 # Основная функция
 # -------------------------------------------------------
 def main():
@@ -496,13 +628,15 @@ def main():
     - применяет pre-filter
     - вызывает OpenAI только для кандидатов
     - добавляет релевантные статьи в editor_queue
+    - считает стоимость OpenAI и отправляет баланс в Telegram
     """
     print("Starting analyzer...")
 
     sb = get_supabase()
     oa = get_openai()
 
-    # Берём самые новые статьи за запуск
+    run_id = create_ai_run(sb)
+
     result = (
         sb.table("articles")
         .select("*")
@@ -518,6 +652,10 @@ def main():
     skipped = 0
     queued = 0
     prefilter_rejected = 0
+    ai_calls = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cost_usd = Decimal("0")
     errors = 0
     quota_error = False
 
@@ -564,7 +702,12 @@ def main():
 
             print(f"Sending article_id={article_id} to AI: {prefilter_reason}")
 
-            analysis = analyze_article(oa, article)
+            analysis, input_tokens, output_tokens, cost_usd = analyze_article(oa, article)
+
+            ai_calls += 1
+            total_input_tokens += input_tokens
+            total_output_tokens += output_tokens
+            total_cost_usd = quantize_money(total_cost_usd + cost_usd)
 
             sb.table("article_analysis").insert({
                 "article_id": article_id,
@@ -600,10 +743,42 @@ def main():
                 quota_error = True
                 break
 
+    starting_balance, spent_total_usd, remaining_estimated_usd = finish_ai_run(
+        sb=sb,
+        run_id=run_id,
+        processed=processed,
+        skipped=skipped,
+        queued=queued,
+        prefilter_rejected=prefilter_rejected,
+        ai_calls=ai_calls,
+        input_tokens=total_input_tokens,
+        output_tokens=total_output_tokens,
+        cost_usd=total_cost_usd,
+    )
+
     print(
         f"Done. processed={processed} skipped={skipped} "
-        f"queued={queued} prefilter_rejected={prefilter_rejected} errors={errors}"
+        f"queued={queued} prefilter_rejected={prefilter_rejected} "
+        f"ai_calls={ai_calls} cost_usd={total_cost_usd} errors={errors}"
     )
+
+    # Telegram-уведомление о балансе после каждого прогона
+    bot_token = get_env("TELEGRAM_BOT_TOKEN", required=False)
+    chat_id = get_env("TELEGRAM_CHAT_ID", required=False)
+
+    if bot_token and chat_id:
+        try:
+            send_run_balance_message(
+                bot_token=bot_token,
+                chat_id=chat_id,
+                run_cost_usd=total_cost_usd,
+                spent_total_usd=spent_total_usd,
+                remaining_estimated_usd=remaining_estimated_usd,
+                ai_calls=ai_calls,
+                prefilter_rejected=prefilter_rejected,
+            )
+        except Exception as e:
+            print(f"WARNING: failed to send Telegram balance message: {repr(e)}")
 
     if quota_error:
         print("Analyzer stopped due to missing API quota. Add billing in platform.openai.com.")

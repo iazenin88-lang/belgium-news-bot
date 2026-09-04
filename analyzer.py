@@ -60,17 +60,22 @@ SYSTEM_PROMPT = """
 Нужно определить:
 1. интересна ли новость этой аудитории
 2. категория новости
-3. важность по шкале 1-10
-4. краткая причина
-5. короткий пересказ на русском
-6. короткий заголовок для Telegram
-7. текст поста для Telegram
+3. общественная важность по шкале 1-10
+4. практическая польза по шкале 1-10
+5. краткая причина
+6. короткий пересказ на русском
+7. короткий заголовок для Telegram
+8. текст поста для Telegram
 
 Считать релевантными в первую очередь:
 - миграция, визы, ВНЖ, убежище, украинские беженцы
 - жильё, аренда, коммунальные правила
 - работа, зарплаты, налоги, пособия
 - транспорт, школы, медицина, безопасность
+- стоимость жизни и способы разумно сократить регулярные расходы в Бельгии
+- сравнения тарифов и существенные акции на мобильную связь, интернет,
+  электричество, газ, страхование и банковские услуги
+- права потребителей, изменения цен, тарифов и условий договоров
 - изменения законов и правил в Бельгии и ЕС, влияющие на жизнь в Бельгии
 - важные новости о Брюсселе, Фландрии, Валлонии
 - новости соседних стран, если они реально влияют на жизнь людей в Бельгии
@@ -84,6 +89,22 @@ SYSTEM_PROMPT = """
 - спорт, криминальные мелочи, если нет практической пользы
 - локальные мелочи без заметного влияния на читателей
 - развлекательные новости низкой значимости без общественного или практического смысла
+- реклама одного бренда без сравнения, ясных условий или заметной выгоды
+- скидки на отдельные необязательные товары и партнёрские рекламные подборки
+
+Оценивай два разных свойства новости:
+- importance_score — общественная значимость, масштаб последствий и число затронутых людей
+- practical_value_score — насколько информация помогает читателю прямо сейчас:
+  сэкономить заметную сумму, выбрать услугу, избежать лишних расходов,
+  выполнить обязательное действие или уложиться в срок
+
+Не занижай practical_value_score только потому, что новость не связана с законом
+или политикой. Конкретное сравнение нескольких предложений на бельгийском рынке
+со значимой экономией обычно заслуживает 7-8. Практический материал для более
+узкой группы — 6. Рекламный текст без сравнения и проверяемых условий — не выше 4.
+
+Считай новость релевантной, если хотя бы общественная важность или практическая
+польза составляет 6 и материал действительно относится к жизни в Бельгии.
 
 Категории используй только из списка:
 migration, housing, work, taxes, transport, education, healthcare, social, politics, safety, europe, other
@@ -105,6 +126,7 @@ URL: {url}
   "is_relevant": true,
   "category": "migration",
   "importance_score": 8,
+  "practical_value_score": 7,
   "reason": "Коротко почему новость важна",
   "russian_summary": "Короткий пересказ на русском, 2-4 предложения.",
   "telegram_title": "Короткий заголовок",
@@ -222,6 +244,35 @@ HIGH_SIGNAL_KEYWORDS = {
     "refugee", "refugees", "asylum", "healthcare", "insurance",
     "border", "customs", "residence", "residency", "work permit",
     "salary", "wage", "unemployment", "education", "police", "safety",
+}
+
+CONSUMER_SERVICE_KEYWORDS = {
+    "telecom", "mobile plan", "mobile subscription", "mobile operator",
+    "broadband", "internet provider", "fixed internet", "phone contract",
+    "energy contract", "electricity contract", "gas contract",
+    "insurance premium", "insurer", "bank account", "bank fee",
+
+    "telecomoperator", "mobiel abonnement", "gsm-abonnement",
+    "internetabonnement", "vast internet", "energiecontract",
+    "elektriciteitscontract", "gascontract", "verzekering", "verzekeraar",
+    "bankrekening", "bankkosten",
+
+    "télécom", "forfait mobile", "abonnement mobile", "abonnement internet",
+    "fournisseur d'internet", "contrat d'énergie", "contrat d'électricité",
+    "assurance", "frais bancaires",
+}
+
+SAVINGS_KEYWORDS = {
+    "discount", "discounts", "promotion", "saving", "savings", "cheaper",
+    "price comparison", "compare prices", "switch provider", "first year",
+    "cashback",
+
+    "korting", "kortingen", "promotie", "aanbieding", "voordeel",
+    "besparen", "goedkoper", "prijsvergelijking", "prijzen vergelijken",
+    "overstappen", "eerste jaar",
+
+    "réduction", "remise", "promotion", "économie", "moins cher",
+    "comparateur", "changer de fournisseur", "première année",
 }
 
 
@@ -375,6 +426,8 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
 
     pass_matches = count_matches(combined_lower, PASS_KEYWORDS)
     high_signal_matches = count_matches(combined_lower, HIGH_SIGNAL_KEYWORDS)
+    consumer_service_matches = count_matches(combined_lower, CONSUMER_SERVICE_KEYWORDS)
+    savings_matches = count_matches(combined_lower, SAVINGS_KEYWORDS)
 
     summary_len = len(summary)
     content_len = len(content)
@@ -390,6 +443,13 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     }
 
     practical_matches = count_matches(combined_lower, practical_keywords)
+
+    if (
+        consumer_service_matches >= 1
+        and savings_matches >= 1
+        and (summary_len >= 80 or content_len >= 250)
+    ):
+        return True, "Потребительская услуга + конкретная экономия или сравнение"
 
     if practical_matches >= 1 and (summary_len >= 80 or content_len >= 250):
         return True, "Есть practical-тема и достаточно содержательный текст"
@@ -522,10 +582,16 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> tuple[dict[str, 
     input_tokens, output_tokens = extract_usage_tokens(response)
     cost_usd = calc_cost_usd(input_tokens, output_tokens)
 
+    public_importance_score = normalize_int(data.get("importance_score", 1))
+    practical_value_score = normalize_int(data.get("practical_value_score", 1))
+    editorial_score = max(public_importance_score, practical_value_score)
+
     analysis = {
         "is_relevant": bool(data.get("is_relevant", False)),
         "category": normalize_text(data.get("category", "other"), 100),
-        "importance_score": normalize_int(data.get("importance_score", 1)),
+        "importance_score": editorial_score,
+        "public_importance_score": public_importance_score,
+        "practical_value_score": practical_value_score,
         "reason": normalize_text(data.get("reason", ""), 1000),
         "russian_summary": normalize_text(data.get("russian_summary", ""), 4000),
         "telegram_title": normalize_text(data.get("telegram_title", ""), 300),
@@ -930,6 +996,8 @@ def main():
                 f"Saved analysis for article_id={article_id}: "
                 f"relevant={analysis['is_relevant']}, "
                 f"importance={analysis['importance_score']}, "
+                f"public_importance={analysis.get('public_importance_score', 1)}, "
+                f"practical_value={analysis.get('practical_value_score', 1)}, "
                 f"category={analysis['category']}"
             )
 

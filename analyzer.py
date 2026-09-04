@@ -114,6 +114,70 @@ URL: {url}
 
 
 # -------------------------------------------------------
+# Отдельная редактура готового текста перед editor_queue
+# -------------------------------------------------------
+EDITOR_SYSTEM_PROMPT = """
+Ты — выпускающий редактор русскоязычного новостного Telegram-канала.
+
+Тебе дают исходную статью и уже подготовленный черновик публикации.
+Твоя задача — не оценивать и не отклонять материал, а вернуть полностью
+отредактированный вариант, готовый для показа редактору канала.
+
+Обязательные требования:
+- используй естественный современный литературный русский язык;
+- исправляй орфографию, грамматику, пунктуацию и неудачный порядок слов;
+- устраняй буквальные переводы, кальки, канцелярит, искусственно образованные
+  и несуществующие слова, в том числе формы вроде «хвасты» и «сгенерация»;
+- каждое предложение должно быть понятным и логически связанным с соседними;
+- при первом упоминании человека укажи полное имя и кратко объясни, кто он;
+- при первом упоминании малоизвестной партии или организации поясни страну
+  и её роль, если это следует из источника;
+- заголовок должен быть понятен без предварительного знания новости;
+- проверяй, что категория соответствует главной теме статьи;
+- не добавляй факты, причинно-следственные связи и политические выводы,
+  которых нет в исходной статье;
+- не придумывай связь с Бельгией, миграцией или жизнью читателей;
+- не добавляй шаблонный вывод о значении новости для Бельгии. Упоминай
+  последствия только тогда, когда они конкретны и подтверждаются источником;
+- если фрагмент черновика искажён или не подтверждается источником, восстанови
+  его по источнику либо удали. Ничего не додумывай;
+- сохрани точный смысл цитат, чисел, дат и названий;
+- текст должен быть кратким, связным и без Markdown-разметки.
+
+Перед ответом перечитай заголовок и каждое предложение как корректор.
+Верни строго JSON без пояснений и без списка внесённых изменений.
+"""
+
+EDITOR_USER_TEMPLATE = """
+Отредактируй публикацию, сверяя её с исходной статьёй.
+
+ИСХОДНАЯ СТАТЬЯ
+Источник: {source_name}
+Заголовок: {source_title}
+Summary: {source_summary}
+Content: {source_content}
+URL: {url}
+
+ЧЕРНОВИК ПУБЛИКАЦИИ
+Категория: {draft_category}
+Заголовок: {draft_title}
+Текст: {draft_text}
+
+Верни JSON такого вида:
+{{
+  "category": "politics",
+  "telegram_title": "Полностью отредактированный заголовок",
+  "telegram_text": "Полностью отредактированный текст"
+}}
+"""
+
+ALLOWED_CATEGORIES = {
+    "migration", "housing", "work", "taxes", "transport", "education",
+    "healthcare", "social", "politics", "safety", "europe", "other",
+}
+
+
+# -------------------------------------------------------
 # Ключевые слова для pre-filter
 # -------------------------------------------------------
 HARD_REJECT_KEYWORDS = {
@@ -472,6 +536,121 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> tuple[dict[str, 
 
 
 # -------------------------------------------------------
+# Независимая редактура текста перед отправкой редактору
+# -------------------------------------------------------
+def review_telegram_text(
+    client: OpenAI,
+    article: dict[str, Any],
+    analysis: dict[str, Any],
+    max_attempts: int = 2,
+) -> tuple[dict[str, Any] | None, int, int, Decimal, int, str]:
+    """
+    Проверяет и переписывает готовый Telegram-текст на хорошем русском языке.
+
+    Редактор всегда возвращает исправленный текст и не решает, публиковать
+    материал или нет. При ошибке формата делает ещё одну попытку.
+    """
+    source_name = normalize_text(article.get("source_name"), 200) or "news"
+    source_title = normalize_text(article.get("title"), 1000)
+    source_summary = normalize_text(article.get("summary"), 4000)
+    source_content = normalize_text(article.get("content"), 12000)
+    url = normalize_text(article.get("canonical_url") or article.get("original_url"), 1000)
+
+    user_prompt = EDITOR_USER_TEMPLATE.format(
+        source_name=source_name,
+        source_title=source_title,
+        source_summary=source_summary,
+        source_content=source_content,
+        url=url,
+        draft_category=normalize_text(analysis.get("category"), 100),
+        draft_title=normalize_text(analysis.get("telegram_title"), 300),
+        draft_text=normalize_text(analysis.get("telegram_text"), 4000),
+    )
+
+    total_input_tokens = 0
+    total_output_tokens = 0
+    calls = 0
+    last_error = ""
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_prompt = user_prompt
+        if attempt > 1:
+            attempt_prompt += (
+                "\nПредыдущий ответ не прошёл техническую проверку. "
+                "Верни непустые поля и строго корректный JSON без Markdown."
+            )
+
+        response = client.responses.create(
+            model=MODEL,
+            input=[
+                {"role": "system", "content": EDITOR_SYSTEM_PROMPT},
+                {"role": "user", "content": attempt_prompt},
+            ],
+        )
+
+        calls += 1
+        input_tokens, output_tokens = extract_usage_tokens(response)
+        total_input_tokens += input_tokens
+        total_output_tokens += output_tokens
+
+        try:
+            raw = pick_text(response)
+            if not raw:
+                raise ValueError("Empty editorial response")
+
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+            data = json.loads(raw)
+            category = normalize_text(data.get("category"), 100)
+            telegram_title = normalize_text(data.get("telegram_title"), 300)
+            telegram_text = normalize_text(data.get("telegram_text"), 4000)
+
+            if not telegram_title:
+                raise ValueError("Editorial response has empty telegram_title")
+            if not telegram_text:
+                raise ValueError("Editorial response has empty telegram_text")
+
+            if category not in ALLOWED_CATEGORIES:
+                category = normalize_text(analysis.get("category"), 100)
+            if category not in ALLOWED_CATEGORIES:
+                category = "other"
+
+            reviewed_analysis = dict(analysis)
+            reviewed_analysis.update({
+                "category": category,
+                "telegram_title": telegram_title,
+                "telegram_text": telegram_text,
+            })
+
+            total_cost_usd = calc_cost_usd(total_input_tokens, total_output_tokens)
+            print(f"Editorial review completed in {attempt} attempt(s)")
+            return (
+                reviewed_analysis,
+                total_input_tokens,
+                total_output_tokens,
+                total_cost_usd,
+                calls,
+                "",
+            )
+
+        except (ValueError, TypeError, json.JSONDecodeError) as e:
+            last_error = repr(e)
+            print(f"WARNING: editorial review attempt {attempt} failed: {last_error}")
+
+    total_cost_usd = calc_cost_usd(total_input_tokens, total_output_tokens)
+    return (
+        None,
+        total_input_tokens,
+        total_output_tokens,
+        total_cost_usd,
+        calls,
+        last_error or "Unknown editorial review error",
+    )
+
+
+# -------------------------------------------------------
 # Добавление статьи в очередь редактора
 # -------------------------------------------------------
 def add_to_editor_queue(sb, article_id: int) -> bool:
@@ -708,6 +887,31 @@ def main():
             total_input_tokens += input_tokens
             total_output_tokens += output_tokens
             total_cost_usd = quantize_money(total_cost_usd + cost_usd)
+
+            # Только кандидаты для редакторского чата проходят обязательную
+            # независимую редактуру. Сырой AI-текст в очередь не попадает.
+            if analysis["is_relevant"] and analysis["importance_score"] >= 6:
+                print(f"Reviewing Telegram text for article_id={article_id}")
+                (
+                    reviewed_analysis,
+                    review_input_tokens,
+                    review_output_tokens,
+                    review_cost_usd,
+                    review_calls,
+                    review_error,
+                ) = review_telegram_text(oa, article, analysis)
+
+                ai_calls += review_calls
+                total_input_tokens += review_input_tokens
+                total_output_tokens += review_output_tokens
+                total_cost_usd = quantize_money(total_cost_usd + review_cost_usd)
+
+                if reviewed_analysis is None:
+                    raise ValueError(
+                        f"Editorial review failed for article_id={article_id}: {review_error}"
+                    )
+
+                analysis = reviewed_analysis
 
             sb.table("article_analysis").insert({
                 "article_id": article_id,

@@ -21,7 +21,9 @@ type QueueRow = {
 };
 
 type CallbackAction =
-  | { kind: "publish" | "reject" | "back"; queueId: number; revision?: number }
+  | { kind: "publish"; queueId: number; revision?: number }
+  | { kind: "reject"; queueId: number; revision?: number }
+  | { kind: "back"; queueId: number; revision?: number }
   | { kind: "feedback"; feedbackType: FeedbackType; queueId: number; revision: number }
   | { kind: "done" };
 
@@ -152,9 +154,17 @@ function parseCallbackData(raw: string): CallbackAction | null {
 
   if (["publish", "reject", "back"].includes(parts[0])) {
     const queueId = parsePositiveInteger(parts[1]);
-    const revision = parts[2] ? parsePositiveInteger(parts[2]) : undefined;
-    if (!queueId || (parts[2] && !revision)) return null;
-    return { kind: parts[0] as "publish" | "reject" | "back", queueId, revision };
+    if (!queueId) return null;
+
+    let revision: number | undefined;
+    if (parts[2]) {
+      const parsedRevision = parsePositiveInteger(parts[2]);
+      if (!parsedRevision) return null;
+      revision = parsedRevision;
+    }
+    if (parts[0] === "publish") return { kind: "publish", queueId, revision };
+    if (parts[0] === "reject") return { kind: "reject", queueId, revision };
+    return { kind: "back", queueId, revision };
   }
 
   if (parts[0] === "feedback") {
@@ -516,7 +526,7 @@ async function handleCallback(callback: Record<string, any>) {
     await showRejectionReasons(callbackId, chatId, messageId, queue);
   } else if (action.kind === "back") {
     await returnToCandidate(callbackId, chatId, messageId, queue);
-  } else {
+  } else if (action.kind === "feedback") {
     await requestFeedbackComment(
       callbackId,
       callbackUserId,

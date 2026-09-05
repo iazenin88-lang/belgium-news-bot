@@ -11,13 +11,17 @@ notifier.py
    - получает анализ из article_analysis
    - получает статью из articles
    - формирует сообщение
-   - добавляет inline-кнопки Publish / Reject
+   - добавляет версионированные кнопки публикации / отклонения
    - отправляет сообщение в Telegram
 4. После успешной отправки меняет статус записи на "sent"
+
+Причину отклонения и комментарий обрабатывает Supabase Edge Function
+telegram-webhook. Исправленный текст возвращается сюда со следующей revision.
 """
 
 import html
 import os
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
@@ -94,7 +98,12 @@ def telegram_send_message(
 # -------------------------------------------------------
 # Формирование текста сообщения
 # -------------------------------------------------------
-def build_message(article_id: int, analysis: dict[str, Any], article: dict[str, Any]) -> str:
+def build_message(
+    article_id: int,
+    analysis: dict[str, Any],
+    article: dict[str, Any],
+    revision: int = 1,
+) -> str:
     """
     Собирает текст кандидата в публикацию для Telegram.
     """
@@ -110,8 +119,12 @@ def build_message(article_id: int, analysis: dict[str, Any], article: dict[str, 
     importance = analysis.get("importance_score") or 0
     url = (article.get("canonical_url") or article.get("original_url") or "").strip()
 
+    candidate_label = "📰 <b>Кандидат в публикацию</b>"
+    if revision > 1:
+        candidate_label = f"♻️ <b>Исправленная версия {revision}</b>"
+
     parts = [
-        "📰 <b>Кандидат в публикацию</b>",
+        candidate_label,
         f"<b>{title}</b>",
         "",
         text,
@@ -131,23 +144,23 @@ def build_message(article_id: int, analysis: dict[str, Any], article: dict[str, 
 # -------------------------------------------------------
 # Формирование inline-кнопок
 # -------------------------------------------------------
-def build_reply_markup(queue_id: int) -> dict[str, Any]:
+def build_reply_markup(queue_id: int, revision: int = 1) -> dict[str, Any]:
     """
-    Создаёт inline-клавиатуру с кнопками Publish / Reject.
+    Создаёт inline-клавиатуру с кнопками публикации и отклонения.
 
-    В callback_data передаём queue_id,
-    чтобы webhook точно понимал, какую запись обновлять.
+    В callback_data передаём queue_id и revision, чтобы webhook не позволил
+    опубликовать устаревший текст после AI-исправления.
     """
     return {
         "inline_keyboard": [
             [
                 {
-                    "text": "✅ Publish",
-                    "callback_data": f"publish:{queue_id}",
+                    "text": "✅ Опубликовать",
+                    "callback_data": f"publish:{queue_id}:{revision}",
                 },
                 {
-                    "text": "❌ Reject",
-                    "callback_data": f"reject:{queue_id}",
+                    "text": "❌ Не публиковать",
+                    "callback_data": f"reject:{queue_id}:{revision}",
                 },
             ]
         ]
@@ -189,6 +202,7 @@ def main():
     for queue_row in queue_rows:
         queue_id = queue_row["id"]
         article_id = queue_row["article_id"]
+        revision = int(queue_row.get("revision") or 1)
 
         print(f"Processing queue_id={queue_id}, article_id={article_id}")
 
@@ -219,20 +233,33 @@ def main():
         article = article_rows[0]
 
         try:
-            message = build_message(article_id, analysis, article)
-            reply_markup = build_reply_markup(queue_id)
+            message = build_message(article_id, analysis, article, revision)
+            reply_markup = build_reply_markup(queue_id, revision)
 
-            telegram_send_message(
+            telegram_result = telegram_send_message(
                 bot_token=bot_token,
                 chat_id=chat_id,
                 text=message,
                 reply_markup=reply_markup,
             )
 
+            sent_message = telegram_result.get("result") or {}
+            sent_chat = sent_message.get("chat") or {}
+            telegram_message_id = sent_message.get("message_id")
+            telegram_chat_id = sent_chat.get("id", chat_id)
+
+            if not telegram_message_id:
+                raise RuntimeError("Telegram response has no message_id")
+
             # После отправки помечаем, что редактору уже показали
             sb.table("editor_queue").update({
-                "status": "sent"
-            }).eq("id", queue_id).execute()
+                "status": "sent",
+                "telegram_chat_id": telegram_chat_id,
+                "telegram_message_id": telegram_message_id,
+                "last_sent_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", queue_id).eq("status", "pending").eq(
+                "revision", revision
+            ).execute()
 
             print(f"Sent queue_id={queue_id}")
             sent += 1

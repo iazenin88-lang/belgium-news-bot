@@ -18,6 +18,7 @@ analyzer.py
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
@@ -69,7 +70,12 @@ SYSTEM_PROMPT = """
 
 Считать релевантными в первую очередь:
 - миграция, визы, ВНЖ, убежище, украинские беженцы
-- жильё, аренда, коммунальные правила
+- все содержательные новости о жилье и аренде в Бельгии: цены и индексация,
+  договоры и гарантии, права арендаторов и обязанности владельцев,
+  доступность жилья, социальное жильё и коммунальные правила
+- правила краткосрочной аренды через Airbnb и другие платформы, а также
+  инициативы ЕС, если они могут повлиять на предложение жилья, цены,
+  права жильцов или полномочия бельгийских городов
 - работа, зарплаты, налоги, пособия
 - транспорт, школы, медицина, безопасность
 - стоимость жизни и способы разумно сократить регулярные расходы в Бельгии
@@ -102,6 +108,12 @@ SYSTEM_PROMPT = """
 или политикой. Конкретное сравнение нескольких предложений на бельгийском рынке
 со значимой экономией обычно заслуживает 7-8. Практический материал для более
 узкой группы — 6. Рекламный текст без сравнения и проверяемых условий — не выше 4.
+
+Содержательная новость об аренде или доступности жилья в Бельгии обычно имеет
+practical_value_score не ниже 6. То же относится к конкретному предложению ЕС,
+которое может изменить правила аренды или полномочия бельгийских городов,
+даже если оно ещё не принято. В таком случае ясно укажи, что это предложение,
+а не действующий закон, и используй категорию housing.
 
 Считай новость релевантной, если хотя бы общественная важность или практическая
 польза составляет 6 и материал действительно относится к жизни в Бельгии.
@@ -212,6 +224,39 @@ HARD_REJECT_KEYWORDS = {
     "livestream sports", "sports betting",
 }
 
+HOUSING_RENTAL_KEYWORDS = {
+    # English
+    "housing", "affordable housing", "housing shortage", "rent", "rents",
+    "rental", "renting", "landlord", "tenant", "tenant rights", "lease",
+    "leases", "security deposit",
+    "rent indexation", "rent cap", "short-term rental", "holiday rental",
+    "rental platform", "social housing", "mortgage", "mortgages", "airbnb",
+
+    # Nederlands
+    "huur", "verhuur", "huren", "huurder", "huurders", "verhuurder",
+    "verhuurders", "huurprijs", "huurprijzen", "huurcontract",
+    "huurcontracten", "huurovereenkomst", "huurovereenkomsten",
+    "huurwaarborg", "huurwaarborgen", "huurindexatie", "huurwoning",
+    "huurwoningen", "woninghuur", "woning", "woningen", "woningmarkt",
+    "betaalbaar wonen", "wooncrisis",
+    "sociale woning", "kortetermijnverhuur", "vakantieverhuur",
+    "verhuurplatform", "verhuurplatformen", "vastgoed", "vastgoedmarkt",
+
+    # Français
+    "logement", "logements", "logement abordable", "crise du logement",
+    "loyer", "loyers", "location", "locations", "locataire", "locataires",
+    "bailleur", "bailleurs", "bail", "baux",
+    "garantie locative", "indexation du loyer", "plafonnement des loyers",
+    "logement social", "location de courte durée", "location touristique",
+    "plateforme de location",
+}
+
+MULTILINGUAL_POLICY_KEYWORDS = {
+    "wetsvoorstel", "wetgeving", "regelgeving", "regulering", "huurregels",
+    "proposition de loi", "projet de loi", "législation", "réglementation",
+    "régulation", "règles de location",
+}
+
 PASS_KEYWORDS = {
     "belgium", "belgian", "brussels", "flanders", "wallonia", "antwerp", "ghent",
     "belgië", "brussel", "vlaanderen", "wallonië", "gent", "antwerpen",
@@ -220,7 +265,7 @@ PASS_KEYWORDS = {
     "migrant", "migrants", "immigration", "integration", "expat", "foreign worker",
     "temporary protection", "residency", "residence card",
 
-    "housing", "rent", "rental", "landlord", "tenant", "mortgage",
+    *HOUSING_RENTAL_KEYWORDS,
     "salary", "wage", "employment", "job market", "unemployment",
     "tax", "taxes", "benefit", "benefits", "pension", "allowance",
 
@@ -239,6 +284,7 @@ PASS_KEYWORDS = {
 
 HIGH_SIGNAL_KEYWORDS = {
     "new law", "law", "rules", "policy", "ban", "decision", "court",
+    *MULTILINGUAL_POLICY_KEYWORDS,
     "tax", "taxes", "visa", "permit", "pension", "housing", "rent",
     "transport", "strike", "school", "benefits", "immigration",
     "refugee", "refugees", "asylum", "healthcare", "insurance",
@@ -369,6 +415,19 @@ def count_matches(text: str, keywords: set[str]) -> int:
     return sum(1 for keyword in keywords if keyword in text_lower)
 
 
+def count_whole_term_matches(text: str, keywords: set[str]) -> int:
+    """
+    Считает отдельные слова и фразы, не принимая, например, rent в current
+    за упоминание аренды.
+    """
+    text_lower = text.lower()
+    return sum(
+        1
+        for keyword in keywords
+        if re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", text_lower)
+    )
+
+
 def quantize_money(value: Decimal) -> Decimal:
     """
     Округляет денежное значение до 6 знаков после запятой.
@@ -428,13 +487,17 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     high_signal_matches = count_matches(combined_lower, HIGH_SIGNAL_KEYWORDS)
     consumer_service_matches = count_matches(combined_lower, CONSUMER_SERVICE_KEYWORDS)
     savings_matches = count_matches(combined_lower, SAVINGS_KEYWORDS)
+    housing_rental_matches = count_whole_term_matches(
+        combined_lower,
+        HOUSING_RENTAL_KEYWORDS,
+    )
 
     summary_len = len(summary)
     content_len = len(content)
 
     practical_keywords = {
         "visa", "permit", "residence permit", "asylum", "refugee", "migrant",
-        "housing", "rent", "tenant", "landlord", "salary", "wage", "employment",
+        "salary", "wage", "employment",
         "tax", "taxes", "pension", "benefit", "benefits",
         "school", "education", "transport", "train", "tram", "bus",
         "healthcare", "hospital", "insurance", "doctor",
@@ -442,7 +505,16 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
         "temporary protection", "work permit",
     }
 
-    practical_matches = count_matches(combined_lower, practical_keywords)
+    practical_matches = (
+        count_matches(combined_lower, practical_keywords)
+        + housing_rental_matches
+    )
+
+    if (
+        housing_rental_matches >= 1
+        and (len(title) >= 25 or summary_len >= 60 or content_len >= 180)
+    ):
+        return True, "Жильё или аренда — приоритетная тема для аудитории"
 
     if (
         consumer_service_matches >= 1

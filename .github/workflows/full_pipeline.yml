@@ -3,11 +3,17 @@ name: Full news pipeline
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0,30 7-22 * * *"
+    # Avoid GitHub Actions' busiest :00/:30 scheduling window.
+    - cron: "7,37 7-22 * * *"
+
+concurrency:
+  group: full-news-pipeline
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - name: Checkout repository

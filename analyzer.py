@@ -5,6 +5,8 @@ analyzer.py
 анализирует новые статьи из таблицы articles и сохраняет результат в article_analysis.
 
 Дополнительно:
+- обрабатывает комментарии редактора и повторно ставит исправленные версии в очередь
+- учитывает тематические отклонения при следующем AI-отборе
 - считает стоимость OpenAI за текущий прогон
 - пишет статистику в ai_runs
 - обновляет ai_balance
@@ -19,13 +21,20 @@ analyzer.py
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 import requests
 from openai import OpenAI
 from supabase import create_client
+
+from editorial_feedback import (
+    CORRECTION_SYSTEM_PROMPT,
+    build_correction_prompt,
+    build_editorial_policy_context,
+    parse_correction_response,
+)
 
 
 # -------------------------------------------------------
@@ -132,6 +141,8 @@ USER_TEMPLATE = """
 Summary: {summary}
 Content: {content}
 URL: {url}
+
+{editorial_policy_context}
 
 Верни JSON такого вида:
 {{
@@ -610,7 +621,11 @@ def calc_cost_usd(input_tokens: int, output_tokens: int) -> Decimal:
 # -------------------------------------------------------
 # Вызов OpenAI
 # -------------------------------------------------------
-def analyze_article(client: OpenAI, article: dict[str, Any]) -> tuple[dict[str, Any], int, int, Decimal]:
+def analyze_article(
+    client: OpenAI,
+    article: dict[str, Any],
+    editorial_policy_context: str = "",
+) -> tuple[dict[str, Any], int, int, Decimal]:
     """
     Отправляет статью в OpenAI и получает:
     - анализ
@@ -630,6 +645,7 @@ def analyze_article(client: OpenAI, article: dict[str, Any]) -> tuple[dict[str, 
         summary=summary,
         content=content,
         url=url,
+        editorial_policy_context=editorial_policy_context,
     )
 
     response = client.responses.create(
@@ -789,6 +805,276 @@ def review_telegram_text(
 
 
 # -------------------------------------------------------
+# Обратная связь редактора
+# -------------------------------------------------------
+def load_editorial_policy_context(sb) -> str:
+    """Загружает недавние решения редактора для тематической калибровки AI."""
+    rows = (
+        sb.table("editorial_feedback")
+        .select(
+            "feedback_type,status,editor_comment,source_title,source_summary,"
+            "draft_title,draft_text,created_at"
+        )
+        .eq("status", "applied")
+        .in_("feedback_type", ["approved", "topic_mismatch"])
+        .order("created_at", desc=True)
+        .limit(40)
+        .execute()
+    ).data or []
+
+    context = build_editorial_policy_context(rows)
+    negative_count = sum(
+        1 for row in rows if row.get("feedback_type") == "topic_mismatch"
+    )
+    positive_count = sum(
+        1 for row in rows if row.get("feedback_type") == "approved"
+    )
+    print(
+        "Loaded editorial policy context: "
+        f"topic_rejections={negative_count} approvals={positive_count} "
+        f"chars={len(context)}"
+    )
+    return context
+
+
+def revise_telegram_text_from_feedback(
+    client: OpenAI,
+    article: dict[str, Any],
+    analysis: dict[str, Any],
+    editor_comment: str,
+    max_attempts: int = 2,
+) -> tuple[dict[str, Any] | None, int, int, Decimal, int, str]:
+    """Исправляет уже показанный черновик по конкретному комментарию редактора."""
+    user_prompt = build_correction_prompt(article, analysis, editor_comment)
+    total_input_tokens = 0
+    total_output_tokens = 0
+    calls = 0
+    last_error = ""
+
+    for attempt in range(1, max_attempts + 1):
+        attempt_prompt = user_prompt
+        if attempt > 1:
+            attempt_prompt += (
+                "\nПредыдущий ответ не прошёл техническую проверку. "
+                "Верни непустые поля и строго корректный JSON без Markdown."
+            )
+
+        response = client.responses.create(
+            model=MODEL,
+            input=[
+                {"role": "system", "content": CORRECTION_SYSTEM_PROMPT},
+                {"role": "user", "content": attempt_prompt},
+            ],
+        )
+        calls += 1
+        input_tokens, output_tokens = extract_usage_tokens(response)
+        total_input_tokens += input_tokens
+        total_output_tokens += output_tokens
+
+        try:
+            title, text = parse_correction_response(pick_text(response))
+            revised_analysis = dict(analysis)
+            revised_analysis.update({
+                "telegram_title": title,
+                "telegram_text": text,
+            })
+            return (
+                revised_analysis,
+                total_input_tokens,
+                total_output_tokens,
+                calc_cost_usd(total_input_tokens, total_output_tokens),
+                calls,
+                "",
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as error:
+            last_error = repr(error)
+            print(
+                f"WARNING: feedback correction attempt {attempt} failed: {last_error}"
+            )
+
+    return (
+        None,
+        total_input_tokens,
+        total_output_tokens,
+        calc_cost_usd(total_input_tokens, total_output_tokens),
+        calls,
+        last_error or "Unknown feedback correction error",
+    )
+
+
+def process_pending_corrections(
+    sb,
+    client: OpenAI,
+    max_items: int = 5,
+) -> dict[str, Any]:
+    """Обрабатывает запросы на исправление и возвращает агрегированную статистику."""
+    stats: dict[str, Any] = {
+        "processed": 0,
+        "failed": 0,
+        "ai_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cost_usd": Decimal("0"),
+        "quota_error": False,
+    }
+
+    # Возвращаем в очередь запрос, который остался processing после аварийного
+    # завершения предыдущего runner. Сравнение по времени не затрагивает живой вызов.
+    stale_before = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    sb.table("editorial_feedback").update({
+        "status": "pending_processing",
+        "processing_started_at": None,
+        "updated_at": now_iso(),
+        "error": "Recovered after stale processing lease",
+    }).eq("feedback_type", "text_correction").eq("status", "processing").lt(
+        "processing_started_at", stale_before
+    ).lt("attempts", 3).execute()
+
+    rows = (
+        sb.table("editorial_feedback")
+        .select("*")
+        .eq("feedback_type", "text_correction")
+        .eq("status", "pending_processing")
+        .lt("attempts", 3)
+        .order("created_at", desc=False)
+        .limit(max_items)
+        .execute()
+    ).data or []
+    print(f"Loaded pending editor corrections: {len(rows)}")
+
+    for pending_row in rows:
+        feedback_id = int(pending_row["id"])
+        claim_result = sb.rpc(
+            "claim_editorial_correction",
+            {"p_feedback_id": feedback_id},
+        ).execute()
+        claimed_rows = claim_result.data or []
+        if not claimed_rows:
+            print(f"Correction {feedback_id} was claimed by another runner")
+            continue
+
+        feedback = claimed_rows[0]
+        attempts = int(feedback.get("attempts") or 1)
+        queue_id = int(feedback["queue_id"])
+        article_id = int(feedback["article_id"])
+        expected_revision = int(feedback["queue_revision"])
+
+        try:
+            queue_rows = (
+                sb.table("editor_queue")
+                .select("id,article_id,status,revision")
+                .eq("id", queue_id)
+                .eq("article_id", article_id)
+                .eq("status", "correction_pending")
+                .eq("revision", expected_revision)
+                .limit(1)
+                .execute()
+            ).data or []
+            article_rows = (
+                sb.table("articles")
+                .select("*")
+                .eq("id", article_id)
+                .limit(1)
+                .execute()
+            ).data or []
+            analysis_rows = (
+                sb.table("article_analysis")
+                .select("*")
+                .eq("article_id", article_id)
+                .limit(1)
+                .execute()
+            ).data or []
+
+            if not queue_rows or not article_rows or not analysis_rows:
+                raise RuntimeError("Correction references missing or stale queue data")
+
+            source_row = article_rows[0]
+            article = {
+                "source_name": "news",
+                "title": source_row.get("title"),
+                "summary": source_row.get("summary"),
+                "content": source_row.get("content"),
+                "canonical_url": source_row.get("canonical_url"),
+                "original_url": source_row.get("original_url"),
+            }
+            analysis = analysis_rows[0]
+
+            (
+                revised,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                calls,
+                correction_error,
+            ) = revise_telegram_text_from_feedback(
+                client,
+                article,
+                analysis,
+                normalize_text(feedback.get("editor_comment"), 2000),
+            )
+
+            stats["ai_calls"] += calls
+            stats["input_tokens"] += input_tokens
+            stats["output_tokens"] += output_tokens
+            stats["cost_usd"] = quantize_money(stats["cost_usd"] + cost_usd)
+
+            if revised is None:
+                raise ValueError(correction_error)
+
+            apply_result = sb.rpc(
+                "apply_editorial_correction",
+                {
+                    "p_feedback_id": feedback_id,
+                    "p_expected_revision": expected_revision,
+                    "p_title": revised["telegram_title"],
+                    "p_text": revised["telegram_text"],
+                    "p_model": MODEL,
+                },
+            ).execute()
+            if apply_result.data is None:
+                raise RuntimeError("Correction transaction returned no revision")
+
+            stats["processed"] += 1
+            print(
+                f"Applied editor correction feedback_id={feedback_id} "
+                f"queue_id={queue_id} new_revision={apply_result.data}"
+            )
+
+        except Exception as error:
+            error_text = repr(error)[:4000]
+            print(f"ERROR correction feedback_id={feedback_id}: {error_text}")
+
+            if "insufficient_quota" in error_text or "RateLimitError" in error_text:
+                sb.table("editorial_feedback").update({
+                    "status": "pending_processing",
+                    "attempts": max(0, attempts - 1),
+                    "processing_started_at": None,
+                    "updated_at": now_iso(),
+                    "error": error_text,
+                }).eq("id", feedback_id).eq("status", "processing").execute()
+                stats["quota_error"] = True
+                break
+
+            next_status = "pending_processing" if attempts < 3 else "failed"
+            sb.table("editorial_feedback").update({
+                "status": next_status,
+                "processing_started_at": None,
+                "updated_at": now_iso(),
+                "error": error_text,
+            }).eq("id", feedback_id).eq("status", "processing").execute()
+
+            if next_status == "failed":
+                sb.table("editor_queue").update({
+                    "status": "correction_failed",
+                }).eq("id", queue_id).eq("status", "correction_pending").eq(
+                    "revision", expected_revision
+                ).execute()
+            stats["failed"] += 1
+
+    return stats
+
+
+# -------------------------------------------------------
 # Добавление статьи в очередь редактора
 # -------------------------------------------------------
 def add_to_editor_queue(sb, article_id: int) -> bool:
@@ -864,6 +1150,8 @@ def finish_ai_run(
     input_tokens: int,
     output_tokens: int,
     cost_usd: Decimal,
+    corrections_processed: int = 0,
+    corrections_failed: int = 0,
 ) -> tuple[Decimal, Decimal, Decimal]:
     """
     Завершает прогон, пишет статистику и обновляет ai_balance.
@@ -883,6 +1171,8 @@ def finish_ai_run(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "cost_usd": str(cost_usd),
+        "corrections_processed_count": corrections_processed,
+        "corrections_failed_count": corrections_failed,
     }).eq("id", run_id).execute()
 
     balance_rows = (
@@ -918,6 +1208,8 @@ def send_run_balance_message(
     remaining_estimated_usd: Decimal,
     ai_calls: int,
     prefilter_rejected: int,
+    corrections_processed: int = 0,
+    corrections_failed: int = 0,
 ) -> None:
     """
     Отправляет Telegram-сообщение после прогона analyzer.
@@ -928,7 +1220,9 @@ def send_run_balance_message(
         f"Spent total: ${spent_total_usd}\n"
         f"Estimated remaining: ${remaining_estimated_usd}\n\n"
         f"AI calls this run: {ai_calls}\n"
-        f"Pre-filter rejected: {prefilter_rejected}"
+        f"Pre-filter rejected: {prefilter_rejected}\n"
+        f"Editor corrections applied: {corrections_processed}\n"
+        f"Editor corrections failed/retrying: {corrections_failed}"
     )
 
     telegram_send_message(bot_token, chat_id, text)
@@ -953,6 +1247,8 @@ def main():
     oa = get_openai()
 
     run_id = create_ai_run(sb)
+    editorial_policy_context = load_editorial_policy_context(sb)
+    correction_stats = process_pending_corrections(sb, oa)
 
     result = (
         sb.table("articles")
@@ -969,14 +1265,19 @@ def main():
     skipped = 0
     queued = 0
     prefilter_rejected = 0
-    ai_calls = 0
-    total_input_tokens = 0
-    total_output_tokens = 0
-    total_cost_usd = Decimal("0")
+    ai_calls = int(correction_stats["ai_calls"])
+    total_input_tokens = int(correction_stats["input_tokens"])
+    total_output_tokens = int(correction_stats["output_tokens"])
+    total_cost_usd = Decimal(correction_stats["cost_usd"])
+    corrections_processed = int(correction_stats["processed"])
+    corrections_failed = int(correction_stats["failed"])
     errors = 0
-    quota_error = False
+    quota_error = bool(correction_stats["quota_error"])
 
     for row in rows:
+        if quota_error:
+            break
+
         article_id = row["id"]
         print(f"Processing article_id={article_id}")
 
@@ -1019,7 +1320,11 @@ def main():
 
             print(f"Sending article_id={article_id} to AI: {prefilter_reason}")
 
-            analysis, input_tokens, output_tokens, cost_usd = analyze_article(oa, article)
+            analysis, input_tokens, output_tokens, cost_usd = analyze_article(
+                oa,
+                article,
+                editorial_policy_context,
+            )
 
             ai_calls += 1
             total_input_tokens += input_tokens
@@ -1098,11 +1403,15 @@ def main():
         input_tokens=total_input_tokens,
         output_tokens=total_output_tokens,
         cost_usd=total_cost_usd,
+        corrections_processed=corrections_processed,
+        corrections_failed=corrections_failed,
     )
 
     print(
         f"Done. processed={processed} skipped={skipped} "
         f"queued={queued} prefilter_rejected={prefilter_rejected} "
+        f"corrections_processed={corrections_processed} "
+        f"corrections_failed={corrections_failed} "
         f"ai_calls={ai_calls} cost_usd={total_cost_usd} errors={errors}"
     )
 
@@ -1120,6 +1429,8 @@ def main():
                 remaining_estimated_usd=remaining_estimated_usd,
                 ai_calls=ai_calls,
                 prefilter_rejected=prefilter_rejected,
+                corrections_processed=corrections_processed,
+                corrections_failed=corrections_failed,
             )
         except Exception as e:
             print(f"WARNING: failed to send Telegram balance message: {repr(e)}")

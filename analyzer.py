@@ -36,6 +36,14 @@ from editorial_feedback import (
     parse_correction_response,
     validate_publication_length,
 )
+from prefilter_learning import (
+    PROPOSAL_SYSTEM_PROMPT,
+    evaluate_policy,
+    format_training_examples,
+    parse_policy_proposal,
+    policy_prefilter_decision,
+    proposal_is_safe,
+)
 
 
 # -------------------------------------------------------
@@ -485,7 +493,12 @@ def telegram_send_message(bot_token: str, chat_id: str, text: str) -> None:
 # -------------------------------------------------------
 # Более строгий pre-filter перед OpenAI
 # -------------------------------------------------------
-def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
+def should_send_to_ai(
+    article: dict[str, Any],
+    *,
+    learning_mode: bool = False,
+    learned_policy: dict[str, Any] | None = None,
+) -> tuple[bool, str]:
     """
     Более строгий pre-filter перед OpenAI.
     """
@@ -499,8 +512,17 @@ def should_send_to_ai(article: dict[str, Any]) -> tuple[bool, str]:
     if not title and not summary and not content:
         return False, "Нет заголовка, summary и content"
 
+    learned_decision, learned_reason = policy_prefilter_decision(
+        combined_lower, learned_policy
+    )
+    if learned_decision is not None:
+        return learned_decision, learned_reason
+
     if contains_any(combined_lower, HARD_REJECT_KEYWORDS):
         return False, "Явно нерелевантная тема (спорт и т.п.)"
+
+    if learning_mode:
+        return True, "Learning mode: пограничный материал передан AI"
 
     pass_matches = count_matches(combined_lower, PASS_KEYWORDS)
     high_signal_matches = count_matches(combined_lower, HIGH_SIGNAL_KEYWORDS)
@@ -1244,6 +1266,134 @@ def send_run_balance_message(
     telegram_send_message(bot_token, chat_id, text)
 
 
+def load_prefilter_state(sb) -> tuple[bool, dict[str, Any] | None, dict[str, Any]]:
+    """Load exploration flag and the last editor-approved policy."""
+    settings_rows = (
+        sb.table("prefilter_settings").select("*").eq("id", 1).limit(1).execute()
+    ).data or []
+    if not settings_rows:
+        return False, None, {}
+    settings = settings_rows[0]
+    policy = None
+    policy_id = settings.get("current_policy_id")
+    if policy_id:
+        rows = (
+            sb.table("prefilter_policy_proposals")
+            .select("policy")
+            .eq("id", policy_id)
+            .eq("status", "active")
+            .limit(1)
+            .execute()
+        ).data or []
+        if rows:
+            policy = rows[0].get("policy")
+    return bool(settings.get("learning_mode")), policy, settings
+
+
+def maybe_create_prefilter_proposal(
+    sb,
+    client: OpenAI,
+    settings: dict[str, Any],
+    bot_token: str,
+    chat_id: str,
+) -> tuple[int, int, Decimal]:
+    """Create and announce one safe proposal after enough labelled decisions."""
+    if not settings:
+        return 0, 0, Decimal("0")
+    pending = (
+        sb.table("prefilter_policy_proposals")
+        .select("id")
+        .eq("status", "pending")
+        .limit(1)
+        .execute()
+    ).data or []
+    if pending:
+        return 0, 0, Decimal("0")
+
+    rows = (
+        sb.table("editorial_feedback")
+        .select(
+            "feedback_type,status,editor_comment,source_title,source_summary,"
+            "draft_title,draft_text,created_at"
+        )
+        .eq("status", "applied")
+        .in_("feedback_type", ["approved", "topic_mismatch"])
+        .order("created_at", desc=True)
+        .limit(200)
+        .execute()
+    ).data or []
+    approvals = sum(row.get("feedback_type") == "approved" for row in rows)
+    declines = sum(row.get("feedback_type") == "topic_mismatch" for row in rows)
+    decisions = approvals + declines
+    minimum = int(settings.get("minimum_training_decisions") or 50)
+    previous = int(settings.get("decisions_at_last_proposal") or 0)
+    if decisions - previous < minimum or approvals < 10 or declines < 10:
+        return 0, 0, Decimal("0")
+
+    response = client.responses.create(
+        model=MODEL,
+        input=[
+            {"role": "system", "content": PROPOSAL_SYSTEM_PROMPT},
+            {"role": "user", "content": format_training_examples(rows)},
+        ],
+    )
+    input_tokens, output_tokens = extract_usage_tokens(response)
+    cost = calc_cost_usd(input_tokens, output_tokens)
+    policy = parse_policy_proposal(pick_text(response))
+    metrics = evaluate_policy(rows, policy)
+    if not proposal_is_safe(metrics):
+        print(f"Prefilter proposal rejected by replay: {metrics}")
+        return input_tokens, output_tokens, cost
+
+    inserted = sb.table("prefilter_policy_proposals").insert({
+        "summary": policy["summary"],
+        "rationale": policy["rationale"],
+        "policy": {
+            "positive_terms": policy["positive_terms"],
+            "negative_terms": policy["negative_terms"],
+        },
+        "metrics": metrics,
+        "training_decisions": decisions,
+        "training_approvals": approvals,
+        "training_topic_declines": declines,
+        "model": MODEL,
+    }).select("id").single().execute().data
+    proposal_id = int(inserted["id"])
+
+    retention = round(float(metrics["approval_retention"]) * 100)
+    rejected = round(float(metrics["decline_rejection"]) * 100)
+    response_message = requests.post(
+        f"{TELEGRAM_API_BASE}/bot{bot_token}/sendMessage",
+        json={
+            "chat_id": chat_id,
+            "text": (
+                "🧠 Новое предложение для prefilter\n\n"
+                f"{policy['summary']}\n\n"
+                f"Решений: {decisions} (✅ {approvals}, ❌ {declines})\n"
+                f"Сохранено прошлых approvals: {retention}%\n"
+                f"Отсекается прошлых topic declines: {rejected}%\n\n"
+                "Правила не изменятся без вашего подтверждения."
+            ),
+            "reply_markup": {"inline_keyboard": [
+                [{"text": "🔎 Детали", "callback_data": f"pf:details:{proposal_id}"}],
+                [
+                    {"text": "✅ Активировать", "callback_data": f"pf:activate:{proposal_id}"},
+                    {"text": "❌ Отклонить", "callback_data": f"pf:reject:{proposal_id}"},
+                ],
+            ]},
+        },
+        timeout=30,
+    )
+    response_message.raise_for_status()
+    message = response_message.json().get("result", {})
+    sb.table("prefilter_policy_proposals").update({
+        "telegram_chat_id": int(message.get("chat", {}).get("id", chat_id)),
+        "telegram_message_id": int(message["message_id"]),
+    }).eq("id", proposal_id).execute()
+    print(f"Sent prefilter proposal id={proposal_id}")
+    return input_tokens, output_tokens, cost
+
+
 # -------------------------------------------------------
 # Основная функция
 # -------------------------------------------------------
@@ -1264,6 +1414,11 @@ def main():
 
     run_id = create_ai_run(sb)
     editorial_policy_context = load_editorial_policy_context(sb)
+    learning_mode, learned_policy, prefilter_settings = load_prefilter_state(sb)
+    print(
+        f"Prefilter state: learning_mode={learning_mode} "
+        f"active_policy={bool(learned_policy)}"
+    )
     correction_stats = process_pending_corrections(sb, oa)
 
     result = (
@@ -1326,7 +1481,11 @@ def main():
         }
 
         try:
-            send_to_ai, prefilter_reason = should_send_to_ai(article)
+            send_to_ai, prefilter_reason = should_send_to_ai(
+                article,
+                learning_mode=learning_mode,
+                learned_policy=learned_policy,
+            )
 
             if not send_to_ai:
                 save_prefilter_rejection(sb, article_id, prefilter_reason)
@@ -1410,6 +1569,23 @@ def main():
                 quota_error = True
                 break
 
+    bot_token = get_env("TELEGRAM_BOT_TOKEN", required=False)
+    chat_id = get_env("TELEGRAM_CHAT_ID", required=False)
+    if bot_token and chat_id and not quota_error:
+        try:
+            proposal_input, proposal_output, proposal_cost = (
+                maybe_create_prefilter_proposal(
+                    sb, oa, prefilter_settings, bot_token, chat_id
+                )
+            )
+            if proposal_input or proposal_output:
+                ai_calls += 1
+                total_input_tokens += proposal_input
+                total_output_tokens += proposal_output
+                total_cost_usd = quantize_money(total_cost_usd + proposal_cost)
+        except Exception as e:
+            print(f"WARNING: prefilter proposal failed safely: {repr(e)}")
+
     starting_balance, spent_total_usd, remaining_estimated_usd = finish_ai_run(
         sb=sb,
         run_id=run_id,
@@ -1434,9 +1610,6 @@ def main():
     )
 
     # Telegram-уведомление о балансе после каждого прогона
-    bot_token = get_env("TELEGRAM_BOT_TOKEN", required=False)
-    chat_id = get_env("TELEGRAM_CHAT_ID", required=False)
-
     if bot_token and chat_id:
         try:
             send_run_balance_message(

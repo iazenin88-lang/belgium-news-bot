@@ -8,11 +8,13 @@ the prompt used to revise a rejected draft.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterable
 
 
 MAX_FEEDBACK_EXAMPLES = 12
 MAX_FEEDBACK_CONTEXT_CHARS = 6000
+MAX_PUBLICATION_WORDS = 70
 
 
 CORRECTION_SYSTEM_PROMPT = """
@@ -29,6 +31,9 @@ CORRECTION_SYSTEM_PROMPT = """
 - не добавляй сведения, которых нет в исходной статье;
 - исправь орфографию, грамматику, пунктуацию, кальки и неестественные обороты;
 - сохрани краткий формат Telegram-публикации и текущую категорию;
+- заголовок и текст вместе должны содержать не более 70 слов; цель — 45–60
+  слов, чтобы публикация читалась за 15–20 секунд;
+- после короткого заголовка дай один короткий абзац из 2–3 предложений;
 - не решай повторно, подходит ли тема каналу: материал уже прошёл отбор;
 - верни полностью готовую новую версию, а не список правок.
 
@@ -85,6 +90,23 @@ def _format_example(row: dict[str, Any], label: str, include_reason: bool) -> st
     return "\n".join(parts)
 
 
+def _format_style_example(row: dict[str, Any]) -> str:
+    reason = _clean(row.get("editor_comment"), 500)
+    before_title = _clean(row.get("draft_title"), 220)
+    before_text = _clean(row.get("draft_text"), 500)
+    after_title = _clean(row.get("revised_title"), 220)
+    after_text = _clean(row.get("revised_text"), 500)
+
+    parts = ["ИСПРАВЛЕНИЕ СТИЛЯ ИЛИ ЯЗЫКА"]
+    if reason:
+        parts.append(f"Замечание редактора: {reason}")
+    if before_title or before_text:
+        parts.append(f"До исправления: {before_title} — {before_text}".strip(" —"))
+    if after_title or after_text:
+        parts.append(f"После исправления: {after_title} — {after_text}".strip(" —"))
+    return "\n".join(parts)
+
+
 def build_editorial_policy_context(
     rows: Iterable[dict[str, Any]],
     *,
@@ -93,13 +115,14 @@ def build_editorial_policy_context(
 ) -> str:
     """Build a compact, balanced context from actual editorial decisions.
 
-    Only explicit topic rejections affect relevance.  Approvals are included as
-    counter-examples so that one rejection does not turn into a broad ban.
-    Other rejection types and incomplete workflow rows are deliberately ignored.
+    Only explicit topic rejections affect relevance. Approvals are included as
+    counter-examples, while completed text corrections affect only language and
+    style. Other rejection types and incomplete rows are deliberately ignored.
     """
 
     negatives: list[str] = []
     positives: list[str] = []
+    style_examples: list[str] = []
 
     for row in rows:
         if row.get("status") != "applied":
@@ -110,21 +133,29 @@ def build_editorial_policy_context(
             negatives.append(_format_example(row, "ОТКЛОНЕНО ПО ТЕМАТИКЕ", True))
         elif feedback_type == "approved" and len(positives) < max_examples:
             positives.append(_format_example(row, "ОПУБЛИКОВАНО", False))
+        elif feedback_type == "text_correction" and len(style_examples) < max_examples:
+            style_examples.append(_format_style_example(row))
 
-    if not negatives:
+    if not negatives and not style_examples:
         return ""
 
-    # Keep negative and positive examples balanced when approvals are available.
-    negative_limit = min(len(negatives), 8)
-    positive_limit = min(len(positives), max_examples - negative_limit, 4)
-    selected = negatives[:negative_limit] + positives[:positive_limit]
+    # Reserve space for style memory so topic history cannot crowd it out.
+    style_limit = min(len(style_examples), 6, max_examples)
+    negative_limit = min(len(negatives), 6, max_examples - style_limit)
+    positive_limit = min(
+        len(positives), 3, max_examples - style_limit - negative_limit
+    )
+    selected = style_examples[:style_limit]
+    selected += negatives[:negative_limit] + positives[:positive_limit]
 
     header = (
         "РЕАЛЬНАЯ РЕДАКТОРСКАЯ ОБРАТНАЯ СВЯЗЬ\n"
-        "Ниже — прошлые решения редактора. Используй тематические отклонения "
-        "как отрицательные примеры, а публикации как положительную калибровку. "
+        "Ниже — прошлые решения и исправления редактора. Используй тематические "
+        "отклонения только для оценки релевантности, публикации как положительную "
+        "калибровку, а исправления только как обязательные правила стиля и языка. "
         "Обобщай причины узко и по смыслу: единичный отказ не запрещает целую "
-        "широкую категорию. Текущую статью всё равно оценивай самостоятельно."
+        "широкую категорию. Не повторяй отмеченные орфографические, грамматические "
+        "и стилистические ошибки. Текущую статью всё равно оценивай самостоятельно."
     )
 
     result = header
@@ -135,6 +166,15 @@ def build_editorial_policy_context(
         result = candidate
 
     return result if result != header else ""
+
+
+def validate_publication_length(title: str, body: str) -> None:
+    """Reject drafts that cannot be read in roughly 15–20 seconds."""
+    word_count = len(re.findall(r"\b[\wЁёА-Яа-я'-]+\b", f"{title} {body}", re.UNICODE))
+    if word_count > MAX_PUBLICATION_WORDS:
+        raise ValueError(
+            f"Publication is too long: {word_count} words; maximum is {MAX_PUBLICATION_WORDS}"
+        )
 
 
 def build_correction_prompt(
@@ -173,5 +213,7 @@ def parse_correction_response(raw: str) -> tuple[str, str]:
         raise ValueError("Correction response has empty telegram_title")
     if not body:
         raise ValueError("Correction response has empty telegram_text")
+
+    validate_publication_length(title, body)
 
     return title, body

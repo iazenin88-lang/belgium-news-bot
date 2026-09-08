@@ -5,6 +5,7 @@ from editorial_feedback import (
     build_correction_prompt,
     build_editorial_policy_context,
     parse_correction_response,
+    validate_publication_length,
 )
 
 
@@ -92,6 +93,45 @@ class EditorialPolicyContextTests(unittest.TestCase):
 
         self.assertIn("Не наша тема", context)
         self.assertIn("ОПУБЛИКОВАНО", context)
+
+    def test_text_correction_trains_future_style_without_topic_rejection(self):
+        context = build_editorial_policy_context([{
+            "feedback_type": "text_correction",
+            "status": "applied",
+            "editor_comment": "Слишком длинно и слово написано неправильно",
+            "draft_title": "Длинный заголовок",
+            "draft_text": "Старый длинный текст",
+            "revised_title": "Короткий заголовок",
+            "revised_text": "Короткий исправленный текст.",
+        }])
+
+        self.assertIn("ИСПРАВЛЕНИЕ СТИЛЯ", context)
+        self.assertIn("Слишком длинно", context)
+        self.assertIn("После исправления", context)
+        self.assertIn("только как обязательные правила стиля", context)
+
+    def test_length_limit_accepts_short_and_rejects_long_publication(self):
+        validate_publication_length("Короткий заголовок", "Короткий текст новости.")
+        with self.assertRaises(ValueError):
+            validate_publication_length("Заголовок", "слово " * 71)
+
+    def test_topic_history_cannot_crowd_out_style_memory(self):
+        rows = [{
+            "feedback_type": "topic_mismatch",
+            "status": "applied",
+            "draft_title": f"Тема {index}",
+            "editor_comment": "Не подходит",
+        } for index in range(12)]
+        rows.append({
+            "feedback_type": "text_correction",
+            "status": "applied",
+            "editor_comment": "Писать короче",
+            "draft_text": "Длинный текст",
+            "revised_text": "Короткий текст",
+        })
+
+        context = build_editorial_policy_context(rows)
+        self.assertIn("Писать короче", context)
 
 
 class CorrectionPromptTests(unittest.TestCase):

@@ -34,6 +34,7 @@ from editorial_feedback import (
     build_correction_prompt,
     build_editorial_policy_context,
     parse_correction_response,
+    validate_publication_length,
 )
 
 
@@ -188,6 +189,10 @@ EDITOR_SYSTEM_PROMPT = """
   его по источнику либо удали. Ничего не додумывай;
 - сохрани точный смысл цитат, чисел, дат и названий;
 - текст должен быть кратким, связным и без Markdown-разметки.
+- заголовок и основной текст вместе — не более 70 слов, оптимально 45–60 слов;
+- после короткого заголовка дай один абзац из 2–3 коротких предложений;
+- весь материал должен читаться за 15–20 секунд: подробности читатель получит
+  по ссылке на оригинал.
 
 Перед ответом перечитай заголовок и каждое предложение как корректор.
 Верни строго JSON без пояснений и без списка внесённых изменений.
@@ -202,6 +207,9 @@ EDITOR_USER_TEMPLATE = """
 Summary: {source_summary}
 Content: {source_content}
 URL: {url}
+
+РЕДАКЦИОННАЯ ПАМЯТЬ
+{editorial_policy_context}
 
 ЧЕРНОВИК ПУБЛИКАЦИИ
 Категория: {draft_category}
@@ -696,6 +704,7 @@ def review_telegram_text(
     client: OpenAI,
     article: dict[str, Any],
     analysis: dict[str, Any],
+    editorial_policy_context: str = "",
     max_attempts: int = 2,
 ) -> tuple[dict[str, Any] | None, int, int, Decimal, int, str]:
     """
@@ -716,6 +725,7 @@ def review_telegram_text(
         source_summary=source_summary,
         source_content=source_content,
         url=url,
+        editorial_policy_context=editorial_policy_context,
         draft_category=normalize_text(analysis.get("category"), 100),
         draft_title=normalize_text(analysis.get("telegram_title"), 300),
         draft_text=normalize_text(analysis.get("telegram_text"), 4000),
@@ -766,6 +776,8 @@ def review_telegram_text(
             if not telegram_text:
                 raise ValueError("Editorial response has empty telegram_text")
 
+            validate_publication_length(telegram_title, telegram_text)
+
             if category not in ALLOWED_CATEGORIES:
                 category = normalize_text(analysis.get("category"), 100)
             if category not in ALLOWED_CATEGORIES:
@@ -813,10 +825,10 @@ def load_editorial_policy_context(sb) -> str:
         sb.table("editorial_feedback")
         .select(
             "feedback_type,status,editor_comment,source_title,source_summary,"
-            "draft_title,draft_text,created_at"
+            "draft_title,draft_text,revised_title,revised_text,created_at"
         )
         .eq("status", "applied")
-        .in_("feedback_type", ["approved", "topic_mismatch"])
+        .in_("feedback_type", ["approved", "topic_mismatch", "text_correction"])
         .order("created_at", desc=True)
         .limit(40)
         .execute()
@@ -829,9 +841,13 @@ def load_editorial_policy_context(sb) -> str:
     positive_count = sum(
         1 for row in rows if row.get("feedback_type") == "approved"
     )
+    correction_count = sum(
+        1 for row in rows if row.get("feedback_type") == "text_correction"
+    )
     print(
         "Loaded editorial policy context: "
         f"topic_rejections={negative_count} approvals={positive_count} "
+        f"text_corrections={correction_count} "
         f"chars={len(context)}"
     )
     return context
@@ -1342,7 +1358,9 @@ def main():
                     review_cost_usd,
                     review_calls,
                     review_error,
-                ) = review_telegram_text(oa, article, analysis)
+                ) = review_telegram_text(
+                    oa, article, analysis, editorial_policy_context
+                )
 
                 ai_calls += review_calls
                 total_input_tokens += review_input_tokens

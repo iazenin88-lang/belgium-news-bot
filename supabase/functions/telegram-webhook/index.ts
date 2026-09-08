@@ -25,6 +25,7 @@ type CallbackAction =
   | { kind: "reject"; queueId: number; revision?: number }
   | { kind: "back"; queueId: number; revision?: number }
   | { kind: "feedback"; feedbackType: FeedbackType; queueId: number; revision: number }
+  | { kind: "prefilter"; action: "details" | "activate" | "reject"; proposalId: number }
   | { kind: "done" };
 
 function requireEnv(name: string): string {
@@ -152,6 +153,15 @@ function parseCallbackData(raw: string): CallbackAction | null {
   if (raw === "done") return { kind: "done" };
   const parts = raw.split(":");
 
+  if (parts[0] === "pf") {
+    const action = parts[1] as "details" | "activate" | "reject";
+    const proposalId = parsePositiveInteger(parts[2]);
+    if (!["details", "activate", "reject"].includes(action) || !proposalId) {
+      return null;
+    }
+    return { kind: "prefilter", action, proposalId };
+  }
+
   if (["publish", "reject", "back"].includes(parts[0])) {
     const queueId = parsePositiveInteger(parts[1]);
     if (!queueId) return null;
@@ -182,6 +192,81 @@ function parseCallbackData(raw: string): CallbackAction | null {
   }
 
   return null;
+}
+
+async function handlePrefilterProposal(
+  callbackId: string,
+  callbackUserId: number,
+  chatId: number,
+  messageId: number,
+  action: Extract<CallbackAction, { kind: "prefilter" }>,
+) {
+  const { data: proposal, error } = await supabase
+    .from("prefilter_policy_proposals")
+    .select("id,status,summary,rationale,policy,metrics,telegram_chat_id,telegram_message_id")
+    .eq("id", action.proposalId)
+    .maybeSingle();
+  if (error) throw error;
+  if (!proposal) {
+    await answerCallbackQuery(callbackId, "Предложение не найдено", true);
+    return;
+  }
+  if (
+    Number(proposal.telegram_chat_id) !== chatId ||
+    Number(proposal.telegram_message_id) !== messageId
+  ) {
+    await answerCallbackQuery(callbackId, "Это неактуальное сообщение", true);
+    return;
+  }
+
+  if (action.action === "details") {
+    const positive = Array.isArray(proposal.policy?.positive_terms)
+      ? proposal.policy.positive_terms.join(", ") || "нет"
+      : "нет";
+    const negative = Array.isArray(proposal.policy?.negative_terms)
+      ? proposal.policy.negative_terms.join(", ") || "нет"
+      : "нет";
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: (
+        "🔎 Детали prefilter #" + proposal.id + "\n\n" +
+        proposal.rationale + "\n\n" +
+        "Пропускать: " + positive + "\n\n" +
+        "Отсекать: " + negative + "\n\n" +
+        "Это только тематические сигналы; исправления языка сюда не входят."
+      ).slice(0, 4000),
+      reply_parameters: { message_id: messageId, allow_sending_without_reply: true },
+    });
+    await answerCallbackQuery(callbackId, "Детали отправлены");
+    return;
+  }
+
+  if (proposal.status !== "pending") {
+    await answerCallbackQuery(callbackId, "Предложение уже обработано", true);
+    return;
+  }
+  const rpcName = action.action === "activate"
+    ? "activate_prefilter_policy"
+    : "reject_prefilter_policy";
+  const { data: changed, error: rpcError } = await supabase.rpc(rpcName, {
+    p_proposal_id: proposal.id,
+    p_editor_user_id: callbackUserId,
+  });
+  if (rpcError) throw rpcError;
+  if (!changed) {
+    await answerCallbackQuery(callbackId, "Предложение уже обработано", true);
+    return;
+  }
+  const label = action.action === "activate"
+    ? "✅ Активировано"
+    : "❌ Отклонено";
+  await editMessageReplyMarkup(chatId, messageId, [[
+    { text: label, callback_data: "done" },
+  ]]);
+  await answerCallbackQuery(
+    callbackId,
+    action.action === "activate" ? "Новый prefilter активирован" : "Предложение отклонено",
+  );
 }
 
 async function getQueue(queueId: number): Promise<QueueRow | null> {
@@ -497,6 +582,16 @@ async function handleCallback(callback: Record<string, any>) {
   }
   if (action.kind === "done") {
     await answerCallbackQuery(callbackId);
+    return;
+  }
+  if (action.kind === "prefilter") {
+    await handlePrefilterProposal(
+      callbackId,
+      callbackUserId,
+      chatId,
+      messageId,
+      action,
+    );
     return;
   }
 

@@ -18,7 +18,7 @@ jobs:
 
       - name: Test Python logic
         run: |
-          python -m py_compile analyzer.py notifier.py editorial_feedback.py
+          python -m py_compile analyzer.py collector.py notifier.py editorial_feedback.py
           python -m unittest discover -s tests -v
 
       - name: Setup Deno

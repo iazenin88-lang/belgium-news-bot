@@ -3,8 +3,8 @@ name: Full news pipeline
 on:
   workflow_dispatch:
   schedule:
-    # Avoid GitHub Actions' busiest :00/:30 scheduling window.
-    - cron: "7,37 7-22 * * *"
+    # Candidate slots cover both CET and CEST. The gate below applies Brussels time.
+    - cron: "7,37 7-23 * * *"
 
 concurrency:
   group: full-news-pipeline
@@ -16,19 +16,40 @@ jobs:
     timeout-minutes: 25
 
     steps:
+      - name: Check Brussels operating window
+        id: schedule_gate
+        shell: bash
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          local_hour=$(TZ=Europe/Brussels date +%H)
+          if (( 10#$local_hour >= 9 || 10#$local_hour == 0 )); then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Outside 09:07-00:37 Europe/Brussels; skipping."
+          fi
+
       - name: Checkout repository
+        if: steps.schedule_gate.outputs.run == 'true'
         uses: actions/checkout@v4
 
       - name: Setup Python
+        if: steps.schedule_gate.outputs.run == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
+        if: steps.schedule_gate.outputs.run == 'true'
         run: |
           pip install openai supabase requests feedparser beautifulsoup4 lxml newspaper3k lxml_html_clean
 
       - name: Run collector
+        if: steps.schedule_gate.outputs.run == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -36,6 +57,7 @@ jobs:
           python collector.py
 
       - name: Run analyzer
+        if: steps.schedule_gate.outputs.run == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
@@ -46,6 +68,7 @@ jobs:
           python analyzer.py
 
       - name: Run notifier
+        if: steps.schedule_gate.outputs.run == 'true'
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}

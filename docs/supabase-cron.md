@@ -5,6 +5,12 @@ The full news pipeline is started by the Supabase Cron job
 "workflow_dispatch" API; GitHub remains the executor for collector, analyzer,
 and notifier.
 
+Text corrections use the same Vault token to dispatch
+`editorial_correction.yml` immediately after an editor comment. That workflow
+runs only the correction for the supplied feedback id and sends the new
+revision back to the editor chat; publication still requires the editor's
+button.
+
 ## Schedule
 
 The job runs at minute 07 and 37 during UTC hours 07–23:
@@ -29,6 +35,10 @@ the value in chat:
 
 The function reads only vault.decrypted_secrets at execution time. After
 rotation, replace the Vault secret with the same name.
+
+The immediate correction dispatcher writes decisions to
+`private.editorial_correction_dispatch_log`. A missing token leaves the
+correction pending, so the regular analyzer can recover it on its next run.
 
 ## Monitoring
 

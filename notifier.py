@@ -168,45 +168,51 @@ def build_reply_markup(queue_id: int, revision: int = 1) -> dict[str, Any]:
 
 
 # -------------------------------------------------------
-# Основная функция
+# Отправка одного кандидата
 # -------------------------------------------------------
-def main():
-    """
-    Главная логика:
-    - загружает pending записи из editor_queue
-    - отправляет их в Telegram
-    - меняет статус на sent
-    """
-    print("Starting notifier...")
+def notify_queue_item(
+    sb,
+    bot_token: str,
+    chat_id: str,
+    queue_id: int,
+) -> bool:
+    """Send one pending candidate and claim it before calling Telegram.
 
-    sb = get_supabase()
-    bot_token = get_env("TELEGRAM_BOT_TOKEN")
-    chat_id = get_env("TELEGRAM_CHAT_ID")
-
-    # Берём максимум 5 pending новостей за один запуск
+    The claim prevents the immediate correction workflow and a scheduled
+    notifier from sending the same revision twice.
+    """
     queue_rows = (
         sb.table("editor_queue")
         .select("*")
+        .eq("id", queue_id)
         .eq("status", "pending")
-        .order("id", desc=False)
-        .limit(5)
+        .limit(1)
         .execute()
     ).data or []
+    if not queue_rows:
+        print(f"Skip queue_id={queue_id}: no longer pending")
+        return False
 
-    print(f"Loaded pending queue items: {len(queue_rows)}")
+    queue_row = queue_rows[0]
+    article_id = int(queue_row["article_id"])
+    revision = int(queue_row.get("revision") or 1)
 
-    sent = 0
-    skipped = 0
-    errors = 0
+    claimed = (
+        sb.table("editor_queue")
+        .update({"status": "notifying"})
+        .eq("id", queue_id)
+        .eq("status", "pending")
+        .eq("revision", revision)
+        .select("id")
+        .maybe_single()
+        .execute()
+    ).data
+    if not claimed:
+        print(f"Skip queue_id={queue_id}: claimed by another notifier")
+        return False
 
-    for queue_row in queue_rows:
-        queue_id = queue_row["id"]
-        article_id = queue_row["article_id"]
-        revision = int(queue_row.get("revision") or 1)
-
-        print(f"Processing queue_id={queue_id}, article_id={article_id}")
-
-        # Получаем анализ статьи
+    telegram_sent = False
+    try:
         analysis_rows = (
             sb.table("article_analysis")
             .select("*")
@@ -214,8 +220,6 @@ def main():
             .limit(1)
             .execute()
         ).data or []
-
-        # Получаем саму статью
         article_rows = (
             sb.table("articles")
             .select("*")
@@ -223,49 +227,91 @@ def main():
             .limit(1)
             .execute()
         ).data or []
-
         if not analysis_rows or not article_rows:
-            print(f"Skip queue_id={queue_id}: missing article or analysis")
-            skipped += 1
-            continue
+            raise RuntimeError("Queue item has no article or analysis")
 
-        analysis = analysis_rows[0]
-        article = article_rows[0]
+        message = build_message(article_id, analysis_rows[0], article_rows[0], revision)
+        telegram_result = telegram_send_message(
+            bot_token=bot_token,
+            chat_id=chat_id,
+            text=message,
+            reply_markup=build_reply_markup(queue_id, revision),
+        )
 
-        try:
-            message = build_message(article_id, analysis, article, revision)
-            reply_markup = build_reply_markup(queue_id, revision)
+        sent_message = telegram_result.get("result") or {}
+        sent_chat = sent_message.get("chat") or {}
+        telegram_message_id = sent_message.get("message_id")
+        telegram_chat_id = sent_chat.get("id", chat_id)
+        if not telegram_message_id:
+            raise RuntimeError("Telegram response has no message_id")
+        telegram_sent = True
 
-            telegram_result = telegram_send_message(
-                bot_token=bot_token,
-                chat_id=chat_id,
-                text=message,
-                reply_markup=reply_markup,
-            )
-
-            sent_message = telegram_result.get("result") or {}
-            sent_chat = sent_message.get("chat") or {}
-            telegram_message_id = sent_message.get("message_id")
-            telegram_chat_id = sent_chat.get("id", chat_id)
-
-            if not telegram_message_id:
-                raise RuntimeError("Telegram response has no message_id")
-
-            # После отправки помечаем, что редактору уже показали
-            sb.table("editor_queue").update({
+        finalized = (
+            sb.table("editor_queue")
+            .update({
                 "status": "sent",
                 "telegram_chat_id": telegram_chat_id,
                 "telegram_message_id": telegram_message_id,
                 "last_sent_at": datetime.now(timezone.utc).isoformat(),
-            }).eq("id", queue_id).eq("status", "pending").eq(
+            })
+            .eq("id", queue_id)
+            .eq("status", "notifying")
+            .eq("revision", revision)
+            .select("id")
+            .maybe_single()
+            .execute()
+        ).data
+        if not finalized:
+            raise RuntimeError("Telegram message sent but queue status was not finalized")
+
+        print(f"Sent queue_id={queue_id} revision={revision}")
+        return True
+    except Exception:
+        if not telegram_sent:
+            sb.table("editor_queue").update({
+                "status": "pending",
+            }).eq("id", queue_id).eq("status", "notifying").eq(
                 "revision", revision
             ).execute()
+        raise
 
-            print(f"Sent queue_id={queue_id}")
-            sent += 1
 
-        except Exception as e:
-            print(f"ERROR queue_id={queue_id}: {repr(e)}")
+# -------------------------------------------------------
+# Основная функция
+# -------------------------------------------------------
+def main():
+    """
+    Отправляет максимум пять pending-кандидатов. Вызов notify_queue_item()
+    используется отдельным workflow для немедленного показа исправленной версии.
+    """
+    print("Starting notifier...")
+
+    sb = get_supabase()
+    bot_token = get_env("TELEGRAM_BOT_TOKEN")
+    chat_id = get_env("TELEGRAM_CHAT_ID")
+
+    queue_rows = (
+        sb.table("editor_queue")
+        .select("id")
+        .eq("status", "pending")
+        .order("id", desc=False)
+        .limit(5)
+        .execute()
+    ).data or []
+    print(f"Loaded pending queue items: {len(queue_rows)}")
+
+    sent = 0
+    skipped = 0
+    errors = 0
+    for row in queue_rows:
+        queue_id = int(row["id"])
+        try:
+            if notify_queue_item(sb, bot_token, chat_id, queue_id):
+                sent += 1
+            else:
+                skipped += 1
+        except Exception as error:
+            print(f"ERROR queue_id={queue_id}: {repr(error)}")
             errors += 1
 
     print(f"Done. sent={sent} skipped={skipped} errors={errors}")

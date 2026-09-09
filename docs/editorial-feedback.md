@@ -12,14 +12,17 @@ stateDiagram-v2
     sent --> awaiting_feedback: reject
     awaiting_feedback --> rejected: topic or other reason
     awaiting_feedback --> correction_pending: text correction
-    correction_pending --> pending: AI rewrite and revision + 1
+    correction_pending --> pending: Immediate AI rewrite and revision + 1
+    pending --> sent: Immediate correction notifier
 ```
 
 ## Feedback types
 
-- `text_correction`: the editor comment is used to rewrite the current draft
-  against the source article. The corrected draft is requeued with a new
-  revision number.
++ `text_correction`: the editor comment is used to rewrite the current draft
+  against the source article. A dedicated workflow is dispatched immediately;
+  it requeues the corrected draft with a new revision and sends that version
+  straight back to this Telegram editor chat. The publication buttons remain,
+  so the editor still approves or rejects the corrected version.
 - `topic_mismatch`: the rejected draft and editor comment become a negative
   example for future relevance decisions.
 - `other_rejection`: the reason is stored for audit, but never changes topic
@@ -29,4 +32,6 @@ stateDiagram-v2
 
 Only callbacks for the latest queue revision and Telegram message are accepted.
 Database functions claim and apply corrections atomically, so overlapping
-scheduled jobs cannot process the same correction twice.
+scheduled jobs cannot process the same correction twice. The notifier claims a
+pending queue row before sending it, so an immediate correction and the regular
+pipeline cannot deliver the same revision twice.

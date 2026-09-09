@@ -657,10 +657,27 @@ async function handleEditorComment(message: Record<string, any>) {
   );
   if (submitError) throw submitError;
 
+  let correctionDispatchStatus = "";
+  if (result === "correction_pending") {
+    const { data: dispatchStatus, error: dispatchError } = await supabase.rpc(
+      "dispatch_editorial_correction",
+      { p_feedback_id: feedback.id },
+    );
+    if (dispatchError) {
+      // The correction remains pending and will be recovered by the regular
+      // analyzer. Do not turn a saved editor comment into a failed webhook.
+      console.error("Immediate correction dispatch failed:", dispatchError);
+    } else {
+      correctionDispatchStatus = String(dispatchStatus || "");
+    }
+  }
+
   const queue = await getQueue(Number(feedback.queue_id));
   if (queue?.telegram_chat_id && queue.telegram_message_id) {
     const statusText = result === "correction_pending"
-      ? "🛠 Исправление готовится"
+      ? correctionDispatchStatus === "queued"
+        ? "🛠 Исправление запущено"
+        : "⏳ Исправление в очереди"
       : feedback.feedback_type === "topic_mismatch"
       ? "🎯 Отклонено: тематика"
       : "❌ Отклонено";
@@ -672,7 +689,9 @@ async function handleEditorComment(message: Record<string, any>) {
   }
 
   const acknowledgement = result === "correction_pending"
-    ? "Принято. ИИ исправит текст по вашему комментарию, и новость придёт сюда новой версией."
+    ? correctionDispatchStatus === "queued"
+      ? "Принято. ИИ исправляет текст по вашему комментарию. Исправленная версия придёт сюда сразу для проверки."
+      : "Принято. Комментарий сохранён. Немедленный запуск пока недоступен; исправление будет обработано ближайшим полным запуском."
     : feedback.feedback_type === "topic_mismatch"
     ? "Принято. Новость отклонена, а причина будет учтена при будущем тематическом отборе."
     : "Принято. Новость отклонена; комментарий сохранён, но не меняет тематическую политику.";

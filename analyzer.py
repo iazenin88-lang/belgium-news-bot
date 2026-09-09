@@ -944,8 +944,15 @@ def process_pending_corrections(
     sb,
     client: OpenAI,
     max_items: int = 5,
+    feedback_id: int | None = None,
 ) -> dict[str, Any]:
-    """Обрабатывает запросы на исправление и возвращает агрегированную статистику."""
+    """Обрабатывает correction requests, optionally limited to one feedback id.
+
+    The dedicated editor-correction workflow uses feedback_id so that one
+    Telegram comment is handled immediately without re-running collection and
+    analysis. The regular analyzer continues to process the queue in batches
+    as a recovery path.
+    """
     stats: dict[str, Any] = {
         "processed": 0,
         "failed": 0,
@@ -954,21 +961,25 @@ def process_pending_corrections(
         "output_tokens": 0,
         "cost_usd": Decimal("0"),
         "quota_error": False,
+        "processed_items": [],
     }
 
     # Возвращаем в очередь запрос, который остался processing после аварийного
     # завершения предыдущего runner. Сравнение по времени не затрагивает живой вызов.
     stale_before = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
-    sb.table("editorial_feedback").update({
+    stale_query = sb.table("editorial_feedback").update({
         "status": "pending_processing",
         "processing_started_at": None,
         "updated_at": now_iso(),
         "error": "Recovered after stale processing lease",
     }).eq("feedback_type", "text_correction").eq("status", "processing").lt(
         "processing_started_at", stale_before
-    ).lt("attempts", 3).execute()
+    ).lt("attempts", 3)
+    if feedback_id is not None:
+        stale_query = stale_query.eq("id", feedback_id)
+    stale_query.execute()
 
-    rows = (
+    rows_query = (
         sb.table("editorial_feedback")
         .select("*")
         .eq("feedback_type", "text_correction")
@@ -976,19 +987,21 @@ def process_pending_corrections(
         .lt("attempts", 3)
         .order("created_at", desc=False)
         .limit(max_items)
-        .execute()
-    ).data or []
+    )
+    if feedback_id is not None:
+        rows_query = rows_query.eq("id", feedback_id)
+    rows = (rows_query.execute()).data or []
     print(f"Loaded pending editor corrections: {len(rows)}")
 
     for pending_row in rows:
-        feedback_id = int(pending_row["id"])
+        current_feedback_id = int(pending_row["id"])
         claim_result = sb.rpc(
             "claim_editorial_correction",
-            {"p_feedback_id": feedback_id},
+            {"p_feedback_id": current_feedback_id},
         ).execute()
         claimed_rows = claim_result.data or []
         if not claimed_rows:
-            print(f"Correction {feedback_id} was claimed by another runner")
+            print(f"Correction {current_feedback_id} was claimed by another runner")
             continue
 
         feedback = claimed_rows[0]
@@ -1062,7 +1075,7 @@ def process_pending_corrections(
             apply_result = sb.rpc(
                 "apply_editorial_correction",
                 {
-                    "p_feedback_id": feedback_id,
+                    "p_feedback_id": current_feedback_id,
                     "p_expected_revision": expected_revision,
                     "p_title": revised["telegram_title"],
                     "p_text": revised["telegram_text"],
@@ -1072,15 +1085,22 @@ def process_pending_corrections(
             if apply_result.data is None:
                 raise RuntimeError("Correction transaction returned no revision")
 
+            new_revision = int(apply_result.data)
             stats["processed"] += 1
+            stats["processed_items"].append({
+                "feedback_id": current_feedback_id,
+                "queue_id": queue_id,
+                "article_id": article_id,
+                "revision": new_revision,
+            })
             print(
-                f"Applied editor correction feedback_id={feedback_id} "
-                f"queue_id={queue_id} new_revision={apply_result.data}"
+                f"Applied editor correction feedback_id={current_feedback_id} "
+                f"queue_id={queue_id} new_revision={new_revision}"
             )
 
         except Exception as error:
             error_text = repr(error)[:4000]
-            print(f"ERROR correction feedback_id={feedback_id}: {error_text}")
+            print(f"ERROR correction feedback_id={current_feedback_id}: {error_text}")
 
             if "insufficient_quota" in error_text or "RateLimitError" in error_text:
                 sb.table("editorial_feedback").update({
@@ -1089,7 +1109,7 @@ def process_pending_corrections(
                     "processing_started_at": None,
                     "updated_at": now_iso(),
                     "error": error_text,
-                }).eq("id", feedback_id).eq("status", "processing").execute()
+                }).eq("id", current_feedback_id).eq("status", "processing").execute()
                 stats["quota_error"] = True
                 break
 
@@ -1099,7 +1119,7 @@ def process_pending_corrections(
                 "processing_started_at": None,
                 "updated_at": now_iso(),
                 "error": error_text,
-            }).eq("id", feedback_id).eq("status", "processing").execute()
+            }).eq("id", current_feedback_id).eq("status", "processing").execute()
 
             if next_status == "failed":
                 sb.table("editor_queue").update({
@@ -1164,12 +1184,12 @@ def save_prefilter_rejection(sb, article_id: int, reason: str) -> None:
 # -------------------------------------------------------
 # Работа с ai_runs / ai_balance
 # -------------------------------------------------------
-def create_ai_run(sb) -> int:
+def create_ai_run(sb, run_type: str = "analyze") -> int:
     """
     Создаёт запись нового прогона и возвращает run_id.
     """
     result = sb.table("ai_runs").insert({
-        "run_type": "analyze",
+        "run_type": run_type,
         "started_at": now_iso(),
     }).execute()
 

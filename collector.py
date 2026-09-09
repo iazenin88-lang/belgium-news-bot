@@ -1,7 +1,11 @@
+import calendar
 import hashlib
 import os
 import re
 import time
+import xml.etree.ElementTree as ElementTree
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import feedparser
@@ -30,6 +34,15 @@ ARTICLE_REQUEST_INTERVAL_SECONDS = float(
     os.getenv("ARTICLE_REQUEST_INTERVAL_SECONDS", "3")
 )
 FINGERPRINT_QUERY_BATCH_SIZE = 40
+BRUSSELS_TIMES_DOMAIN = "brusselstimes.com"
+BRUSSELS_TIMES_ARTICLE_API = "https://apiv2.brusselstimes.com/article"
+BRUSSELS_TIMES_ENTRY_LIMIT = max(
+    1,
+    int(os.getenv("BRUSSELS_TIMES_ENTRY_LIMIT", "40")),
+)
+
+SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
+GOOGLE_NEWS_NAMESPACE = "http://www.google.com/schemas/sitemap-news/0.9"
 
 # VRT supplies a useful abstract in its public feed. Do not open every linked
 # page: one feed request per pipeline run is sufficient for collection.
@@ -105,9 +118,78 @@ def registered_domain(hostname: str | None) -> str:
     return hostname
 
 
+def hostname_matches(hostname: str | None, domain: str) -> bool:
+    hostname = (hostname or "").lower().rstrip(".")
+    return hostname == domain or hostname.endswith(f".{domain}")
+
+
 def source_uses_feed_only(source: dict) -> bool:
     hostname = urlparse(source.get("url") or "").hostname
     return registered_domain(hostname) in FEED_ONLY_DOMAINS
+
+
+def source_is_brussels_times(source: dict) -> bool:
+    hostname = urlparse(source.get("url") or "").hostname
+    return hostname_matches(hostname, BRUSSELS_TIMES_DOMAIN)
+
+
+def parse_publication_date(value: str | None):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).timetuple()
+
+
+def parse_google_news_sitemap(content: bytes):
+    """Convert a Google News sitemap into feed-like entries."""
+    root = ElementTree.fromstring(content)
+    if root.tag != f"{{{SITEMAP_NAMESPACE}}}urlset":
+        raise ValueError("XML is not a sitemap urlset")
+
+    entries = []
+    namespaces = {
+        "sitemap": SITEMAP_NAMESPACE,
+        "news": GOOGLE_NEWS_NAMESPACE,
+    }
+    for url_node in root.findall("sitemap:url", namespaces):
+        link = (url_node.findtext("sitemap:loc", default="", namespaces=namespaces) or "").strip()
+        news_node = url_node.find("news:news", namespaces)
+        if not link or news_node is None:
+            continue
+
+        title = (
+            news_node.findtext("news:title", default="", namespaces=namespaces)
+            or ""
+        ).strip()
+        published = (
+            news_node.findtext(
+                "news:publication_date",
+                default="",
+                namespaces=namespaces,
+            )
+            or ""
+        ).strip()
+        entries.append({
+            "link": link,
+            "title": title,
+            "published": published,
+            "published_parsed": parse_publication_date(published),
+        })
+
+    entries.sort(
+        key=lambda entry: (
+            calendar.timegm(entry["published_parsed"])
+            if entry.get("published_parsed")
+            else -1
+        ),
+        reverse=True,
+    )
+    return SimpleNamespace(entries=entries)
 
 
 def fetch_feed(feed_url: str, session: requests.Session):
@@ -122,10 +204,68 @@ def fetch_feed(feed_url: str, session: requests.Session):
     if "text/html" in content_type:
         raise ValueError(f"Feed returned HTML instead of RSS/Atom: {feed_url}")
 
+    try:
+        root = ElementTree.fromstring(response.content)
+    except ElementTree.ParseError:
+        root = None
+    if root is not None and root.tag == f"{{{SITEMAP_NAMESPACE}}}urlset":
+        sitemap = parse_google_news_sitemap(response.content)
+        if not sitemap.entries:
+            raise ValueError(f"News sitemap contains no entries: {feed_url}")
+        return sitemap
+
     feed = feedparser.parse(response.content)
     if not getattr(feed, "entries", None):
         raise ValueError(f"Feed contains no entries: {feed_url}")
     return feed
+
+
+def brussels_times_article_id(url: str) -> int | None:
+    for segment in urlparse(url).path.split("/"):
+        if segment.isdigit():
+            return int(segment)
+    return None
+
+
+def clean_summary(value: str | None) -> str | None:
+    if not value:
+        return None
+    text = BeautifulSoup(value, "html.parser").get_text(" ", strip=True)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:4000] or None
+
+
+def extract_brussels_times_summary(
+    url: str,
+    session: requests.Session,
+) -> str | None:
+    """Fetch only the publisher-provided abstract, never the full article body."""
+    article_id = brussels_times_article_id(url)
+    if article_id is None:
+        return None
+
+    try:
+        response = session.get(
+            BRUSSELS_TIMES_ARTICLE_API,
+            params={"id": article_id},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+            headers={**REQUEST_HEADERS, "Accept": "application/json"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    response_id = payload.get("id")
+    if response_id is not None and str(response_id) != str(article_id):
+        return None
+
+    return (
+        clean_summary(payload.get("seo_description"))
+        or clean_summary(payload.get("sub"))
+    )
 
 
 def extract_text_from_html(
@@ -218,6 +358,7 @@ def collect_source(
     session: requests.Session,
     pacer: RequestPacer,
     extractor=extract_text_from_html,
+    brussels_times_extractor=extract_brussels_times_summary,
 ) -> tuple[int, int]:
     source_id = source["id"]
     feed = fetch_feed(source["url"], session)
@@ -225,7 +366,12 @@ def collect_source(
     candidates = []
     seen = set()
     duplicate_count = 0
-    for entry in feed.entries[:100]:
+    entry_limit = (
+        BRUSSELS_TIMES_ENTRY_LIMIT
+        if source_is_brussels_times(source)
+        else 100
+    )
+    for entry in feed.entries[:entry_limit]:
         candidate = build_candidate(source_id, entry)
         if candidate is None:
             continue
@@ -243,12 +389,19 @@ def collect_source(
 
     new_count = 0
     feed_only = source_uses_feed_only(source)
+    brussels_times = source_is_brussels_times(source)
     for row in candidates:
         if row["fingerprint"] in known:
             duplicate_count += 1
             continue
 
-        if not feed_only:
+        if brussels_times:
+            pacer.wait()
+            row["summary"] = brussels_times_extractor(
+                row["canonical_url"],
+                session,
+            )
+        elif not feed_only:
             pacer.wait()
             row["content"] = extractor(row["canonical_url"], session)
 
@@ -282,7 +435,8 @@ def main():
             dup_count += source_dup
             print(
                 f"Source {source_name}: new={source_new} "
-                f"dup={source_dup} feed_only={source_uses_feed_only(source)}"
+                f"dup={source_dup} feed_only={source_uses_feed_only(source)} "
+                f"brussels_times={source_is_brussels_times(source)}"
             )
         except Exception as exc:
             err_count += 1

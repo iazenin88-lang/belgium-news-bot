@@ -44,6 +44,14 @@ from prefilter_learning import (
     policy_prefilter_decision,
     proposal_is_safe,
 )
+from semantic_dedup import (
+    EVENT_HISTORY_LIMIT,
+    EVENT_HISTORY_LOOKBACK_DAYS,
+    format_event_history,
+    make_event_history_entry,
+    parse_article_id,
+    reconcile_duplicate_decision,
+)
 
 
 # -------------------------------------------------------
@@ -136,6 +144,19 @@ practical_value_score не ниже 6. То же относится к конк�
 Считай новость релевантной, если хотя бы общественная важность или практическая
 польза составляет 6 и материал действительно относится к жизни в Бельгии.
 
+Проверяй, не описывает ли статья то же самое реальное событие, которое уже
+есть в блоке «УЖЕ ПРЕДЛОЖЕННЫЕ ИЛИ ОДОБРЕННЫЕ МАТЕРИАЛЫ». Событие считается
+повтором, если совпадают конкретный инцидент, люди/организации, место и
+действие, даже когда статья пришла с другого сайта и заголовок сформулирован
+иначе. Одной общей темы (например, «аренда» или «безопасность») недостаточно.
+
+Если это тот же инцидент, но появились существенные новые факты, новый этап
+расследования, решение властей или заметные последствия, укажи
+is_duplicate_event=true и is_material_update=true: такой материал можно
+предложить редактору. Если существенного обновления нет, укажи
+is_duplicate_event=true и is_material_update=false: материал не нужно снова
+предлагать. Не считай материал повтором, если не уверен.
+
 Категории используй только из списка:
 migration, housing, work, taxes, transport, education, healthcare, social, politics, safety, europe, other
 
@@ -153,6 +174,12 @@ URL: {url}
 
 {editorial_policy_context}
 
+СВЕРКА С НЕДАВНИМ ПОКРЫТИЕМ СОБЫТИЙ
+{event_history_context}
+
+Сравнивай статью с этим списком только по конкретному событию, а не по общей
+теме. Если есть совпадение, укажи точный article_id из списка.
+
 Верни JSON такого вида:
 {{
   "is_relevant": true,
@@ -162,7 +189,11 @@ URL: {url}
   "reason": "Коротко почему новость важна",
   "russian_summary": "Короткий пересказ на русском, 2-4 предложения.",
   "telegram_title": "Короткий заголовок",
-  "telegram_text": "Готовый короткий текст для Telegram без markdown."
+  "telegram_text": "Готовый короткий текст для Telegram без markdown.",
+  "is_duplicate_event": false,
+  "duplicate_of_article_id": null,
+  "duplicate_reason": "",
+  "is_material_update": false
 }}
 """
 
@@ -655,6 +686,7 @@ def analyze_article(
     client: OpenAI,
     article: dict[str, Any],
     editorial_policy_context: str = "",
+    event_history: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], int, int, Decimal]:
     """
     Отправляет статью в OpenAI и получает:
@@ -676,6 +708,7 @@ def analyze_article(
         content=content,
         url=url,
         editorial_policy_context=editorial_policy_context,
+        event_history_context=format_event_history(event_history),
     )
 
     response = client.responses.create(
@@ -714,6 +747,15 @@ def analyze_article(
         "russian_summary": normalize_text(data.get("russian_summary", ""), 4000),
         "telegram_title": normalize_text(data.get("telegram_title", ""), 300),
         "telegram_text": normalize_text(data.get("telegram_text", ""), 4000),
+        "is_duplicate_event": data.get("is_duplicate_event", False),
+        "duplicate_of_article_id": parse_article_id(
+            data.get("duplicate_of_article_id")
+        ),
+        "duplicate_reason": normalize_text(
+            data.get("duplicate_reason", ""),
+            1000,
+        ),
+        "is_material_update": data.get("is_material_update", False),
     }
 
     return analysis, input_tokens, output_tokens, cost_usd
@@ -873,6 +915,127 @@ def load_editorial_policy_context(sb) -> str:
         f"chars={len(context)}"
     )
     return context
+
+
+EVENT_COVERAGE_STATUSES = [
+    # Pending/sent rows prevent two copies of the same event from appearing in
+    # one editor session. Approved/published rows are the durable coverage
+    # memory. Rejected rows are intentionally excluded: an editor may reject a
+    # story for style or another reason without saying the event was covered.
+    "pending",
+    "notifying",
+    "sent",
+    "awaiting_feedback",
+    "correction_pending",
+    "publishing",
+    "approved",
+    "published",
+]
+
+
+def load_recent_event_history(
+    sb,
+    *,
+    limit: int = EVENT_HISTORY_LIMIT,
+    lookback_days: int = EVENT_HISTORY_LOOKBACK_DAYS,
+) -> list[dict[str, Any]]:
+    """Load compact cross-source coverage context for the AI prompt.
+
+    Queue status is the source of truth for whether an article has already been
+    proposed or approved. We deliberately fetch only a bounded recent window;
+    this keeps prompt size and OpenAI cost predictable while covering the period
+    in which duplicate wire stories normally arrive.
+    """
+    since = (
+        datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    ).isoformat()
+    queue_rows = (
+        sb.table("editor_queue")
+        .select("article_id,status,created_at")
+        .in_("status", EVENT_COVERAGE_STATUSES)
+        .gte("created_at", since)
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    ).data or []
+
+    article_ids = [
+        article_id
+        for article_id in (
+            parse_article_id(row.get("article_id")) for row in queue_rows
+        )
+        if article_id is not None
+    ]
+    if not article_ids:
+        return []
+
+    article_rows = (
+        sb.table("articles")
+        .select("id,source_id,title,summary,published_at,canonical_url,original_url")
+        .in_("id", article_ids)
+        .execute()
+    ).data or []
+    analysis_rows = (
+        sb.table("article_analysis")
+        .select("article_id,russian_summary,telegram_title,telegram_text,category")
+        .in_("article_id", article_ids)
+        .execute()
+    ).data or []
+
+    source_ids = {
+        int(row["source_id"])
+        for row in article_rows
+        if row.get("source_id") is not None
+    }
+    source_rows = []
+    if source_ids:
+        source_rows = (
+            sb.table("sources")
+            .select("id,name")
+            .in_("id", list(source_ids))
+            .execute()
+        ).data or []
+
+    article_by_id = {
+        int(row["id"]): row
+        for row in article_rows
+        if row.get("id") is not None
+    }
+    analysis_by_article_id = {
+        int(row["article_id"]): row
+        for row in analysis_rows
+        if row.get("article_id") is not None
+    }
+    source_by_id = {
+        int(row["id"]): row.get("name") or f"source-{row['id']}"
+        for row in source_rows
+        if row.get("id") is not None
+    }
+
+    history: list[dict[str, Any]] = []
+    for queue_row in queue_rows:
+        article_id = parse_article_id(queue_row.get("article_id"))
+        if article_id is None:
+            continue
+        article_row = article_by_id.get(article_id)
+        if not article_row:
+            continue
+        analysis_row = analysis_by_article_id.get(article_id) or {}
+        source_id = article_row.get("source_id")
+        history.append({
+            "article_id": article_id,
+            "status": queue_row.get("status") or "unknown",
+            "source_name": source_by_id.get(
+                int(source_id), f"source-{source_id}"
+            ) if source_id is not None else "news",
+            "title": article_row.get("title") or "",
+            "summary": article_row.get("summary") or "",
+            "russian_summary": analysis_row.get("russian_summary") or "",
+            "telegram_title": analysis_row.get("telegram_title") or "",
+            "telegram_text": analysis_row.get("telegram_text") or "",
+            "published_at": article_row.get("published_at") or "",
+        })
+    return history[:limit]
 
 
 def revise_telegram_text_from_feedback(
@@ -1452,6 +1615,30 @@ def main():
     rows = result.data or []
     print(f"Loaded articles: {len(rows)}")
 
+    try:
+        event_history = load_recent_event_history(sb)
+    except Exception as error:
+        # Deduplication must never stop collection/analysis.  A missing history
+        # is fail-open for this run and is visible in logs for investigation.
+        print(f"WARNING: event history unavailable; dedup skipped: {repr(error)}")
+        event_history = []
+    print(f"Loaded event coverage history: {len(event_history)} item(s)")
+
+    try:
+        source_rows = (
+            sb.table("sources")
+            .select("id,name")
+            .execute()
+        ).data or []
+        source_names = {
+            int(source["id"]): source.get("name") or f"source-{source['id']}"
+            for source in source_rows
+            if source.get("id") is not None
+        }
+    except Exception as error:
+        print(f"WARNING: source names unavailable: {repr(error)}")
+        source_names = {}
+
     processed = 0
     skipped = 0
     queued = 0
@@ -1488,16 +1675,32 @@ def main():
             if existing_row.get("is_relevant") and (existing_row.get("importance_score") or 0) >= 6:
                 if add_to_editor_queue(sb, article_id):
                     queued += 1
+                    event_history.insert(0, make_event_history_entry(
+                        article_id,
+                        {
+                            "source_name": source_names.get(
+                                int(row.get("source_id")), "news"
+                            ) if row.get("source_id") is not None else "news",
+                            "title": row.get("title"),
+                            "summary": row.get("summary"),
+                            "published_at": row.get("published_at"),
+                        },
+                        existing_row,
+                    ))
+                    del event_history[EVENT_HISTORY_LIMIT:]
 
             continue
 
         article = {
-            "source_name": "news",
+            "source_name": source_names.get(
+                int(row.get("source_id")), "news"
+            ) if row.get("source_id") is not None else "news",
             "title": row.get("title"),
             "summary": row.get("summary"),
             "content": row.get("content"),
             "canonical_url": row.get("canonical_url"),
             "original_url": row.get("original_url"),
+            "published_at": row.get("published_at"),
         }
 
         try:
@@ -1519,6 +1722,7 @@ def main():
                 oa,
                 article,
                 editorial_policy_context,
+                event_history,
             )
 
             ai_calls += 1
@@ -1526,9 +1730,40 @@ def main():
             total_output_tokens += output_tokens
             total_cost_usd = quantize_money(total_cost_usd + cost_usd)
 
+            history_ids = {
+                article_id_from_history
+                for article_id_from_history in (
+                    parse_article_id(history_row.get("article_id"))
+                    for history_row in event_history
+                )
+                if article_id_from_history is not None
+            }
+            analysis, duplicate_blocked, dedup_note = reconcile_duplicate_decision(
+                analysis,
+                history_ids,
+            )
+            if dedup_note:
+                print(
+                    f"article_id={article_id} duplicate decision note: {dedup_note}"
+                )
+            if duplicate_blocked:
+                analysis["is_relevant"] = False
+                analysis["reason"] = (
+                    "Повтор уже покрытого события: "
+                    f"{analysis.get('duplicate_reason') or 'без существенного обновления'}"
+                )
+                print(
+                    f"Blocked cross-source duplicate article_id={article_id} "
+                    f"of article_id={analysis['duplicate_of_article_id']}"
+                )
+
             # Только кандидаты для редакторского чата проходят обязательную
             # независимую редактуру. Сырой AI-текст в очередь не попадает.
-            if analysis["is_relevant"] and analysis["importance_score"] >= 6:
+            if (
+                not duplicate_blocked
+                and analysis["is_relevant"]
+                and analysis["importance_score"] >= 6
+            ):
                 print(f"Reviewing Telegram text for article_id={article_id}")
                 (
                     reviewed_analysis,
@@ -1562,6 +1797,10 @@ def main():
                 "russian_summary": analysis["russian_summary"],
                 "telegram_title": analysis["telegram_title"],
                 "telegram_text": analysis["telegram_text"],
+                "is_duplicate_event": analysis["is_duplicate_event"],
+                "duplicate_of_article_id": analysis["duplicate_of_article_id"],
+                "duplicate_reason": analysis["duplicate_reason"],
+                "is_material_update": analysis["is_material_update"],
             }).execute()
 
             processed += 1
@@ -1578,6 +1817,12 @@ def main():
             if analysis["is_relevant"] and analysis["importance_score"] >= 6:
                 if add_to_editor_queue(sb, article_id):
                     queued += 1
+                    event_history.insert(0, make_event_history_entry(
+                        article_id,
+                        article,
+                        analysis,
+                    ))
+                    del event_history[EVENT_HISTORY_LIMIT:]
 
         except Exception as e:
             error_text = repr(e)

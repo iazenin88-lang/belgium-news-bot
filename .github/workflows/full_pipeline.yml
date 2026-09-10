@@ -2,9 +2,6 @@ name: Full news pipeline
 
 on:
   workflow_dispatch:
-  schedule:
-    # Candidate slots cover both CET and CEST. The gate below applies Brussels time.
-    - cron: "7,37 7-23 * * *"
 
 concurrency:
   group: full-news-pipeline

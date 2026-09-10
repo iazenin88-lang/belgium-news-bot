@@ -1,0 +1,40 @@
+name: Immediate editorial correction
+
+on:
+  workflow_dispatch:
+    inputs:
+      feedback_id:
+        description: "Supabase editorial_feedback id to correct"
+        required: true
+        type: string
+
+concurrency:
+  group: editorial-correction-${{ inputs.feedback_id }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install libraries
+        run: |
+          pip install openai supabase requests
+
+      - name: Correct and notify editor
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python correction_pipeline.py --feedback-id "${{ inputs.feedback_id }}"

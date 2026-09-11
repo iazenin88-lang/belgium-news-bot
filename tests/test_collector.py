@@ -80,6 +80,7 @@ from collector import (
     build_candidate,
     collect_source,
     extract_brussels_times_summary,
+    fetch_brussels_times_article,
     fetch_feed,
     parse_google_news_sitemap,
     source_is_brussels_times,
@@ -302,6 +303,41 @@ class CollectorAccessTests(unittest.TestCase):
             session.calls[0][1]["headers"]["Accept"],
             "application/json",
         )
+
+    def test_brussels_times_article_metadata_is_validated(self):
+        response = FakeResponse(
+            content_type="application/json",
+            json_payload={
+                "id": 2308789,
+                "title": "A historical Brussels Times article",
+                "published": "2026-09-09 06:00:00",
+                "seo_description": "Short publisher description.",
+            },
+        )
+        session = FakeSession(response)
+
+        metadata = fetch_brussels_times_article(
+            "https://www.brusselstimes.com/2308789/example-article",
+            session,
+        )
+
+        self.assertEqual(metadata["id"], 2308789)
+        self.assertEqual(metadata["title"], "A historical Brussels Times article")
+        self.assertEqual(session.calls[0][0], BRUSSELS_TIMES_ARTICLE_API)
+
+    def test_brussels_times_article_metadata_rejects_wrong_id(self):
+        response = FakeResponse(
+            content_type="application/json",
+            json_payload={"id": 999999, "title": "Wrong article"},
+        )
+        session = FakeSession(response)
+
+        metadata = fetch_brussels_times_article(
+            "https://www.brusselstimes.com/2308789/example-article",
+            session,
+        )
+
+        self.assertIsNone(metadata)
 
     def test_vrt_new_article_is_saved_without_opening_article_page(self):
         database = FakeDatabase()

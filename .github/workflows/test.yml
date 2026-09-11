@@ -18,7 +18,7 @@ jobs:
 
       - name: Test Python logic
         run: |
-          python -m py_compile analyzer.py semantic_dedup.py collector.py notifier.py editorial_feedback.py
+          python -m py_compile analyzer.py semantic_dedup.py collector.py backfill_brussels_times.py notifier.py editorial_feedback.py
           python -m py_compile correction_pipeline.py
           python -m unittest discover -s tests -v
 

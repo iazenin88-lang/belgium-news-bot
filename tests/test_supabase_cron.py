@@ -28,6 +28,10 @@ class SupabaseCronConfigurationTests(unittest.TestCase):
         self.assertIn("workflow_dispatch:", WORKFLOW)
         self.assertNotRegex(WORKFLOW, r"(?m)^\s+schedule:")
 
+    def test_manual_dispatch_can_backfill_explicit_brussels_times_urls(self) -> None:
+        self.assertIn("brussels_times_backfill_urls", WORKFLOW)
+        self.assertIn("backfill_brussels_times.py", WORKFLOW)
+
 
 if __name__ == "__main__":
     unittest.main()

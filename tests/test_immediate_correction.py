@@ -43,6 +43,8 @@ class ImmediateCorrectionTests(unittest.TestCase):
         notifier = (ROOT / "notifier.py").read_text()
         self.assertIn('"status": "notifying"', notifier)
         self.assertIn('.eq("status", "pending")', notifier)
+        self.assertNotIn(".maybe_single()", notifier)
+        self.assertIn("Notifier failed for", notifier)
         self.assertIn("Telegram message sent but queue status was not finalized", notifier)
 
 

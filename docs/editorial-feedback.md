@@ -35,3 +35,18 @@ Database functions claim and apply corrections atomically, so overlapping
 scheduled jobs cannot process the same correction twice. The notifier claims a
 pending queue row before sending it, so an immediate correction and the regular
 pipeline cannot deliver the same revision twice.
+
+## Next-news navigation
+
+Telegram bots cannot control the editor's mobile scroll position or restore the
+client's unread markers. After an approval or a non-correction rejection, the
+bot therefore offers `⏭ Следующая новость` at the bottom of the chat. The
+button selects the next still-`sent` candidate by its Telegram message order,
+copies it to the bottom with the normal publication buttons, and makes that
+copy the active callback message. If no already-sent candidate remains, the
+oldest `pending` row is claimed and sent immediately. `/next` provides the
+same action without a button.
+
+Text-correction comments do not advance automatically: the corrected revision
+must arrive and remain subject to manual approval, preserving the immediate
+correction workflow.

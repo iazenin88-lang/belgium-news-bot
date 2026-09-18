@@ -24,8 +24,18 @@ type CallbackAction =
   | { kind: "publish"; queueId: number; revision?: number }
   | { kind: "reject"; queueId: number; revision?: number }
   | { kind: "back"; queueId: number; revision?: number }
-  | { kind: "feedback"; feedbackType: FeedbackType; queueId: number; revision: number }
-  | { kind: "prefilter"; action: "details" | "activate" | "reject"; proposalId: number }
+  | { kind: "next"; queueId: number; revision?: number }
+  | {
+    kind: "feedback";
+    feedbackType: FeedbackType;
+    queueId: number;
+    revision: number;
+  }
+  | {
+    kind: "prefilter";
+    action: "details" | "activate" | "reject";
+    proposalId: number;
+  }
   | { kind: "done" };
 
 function requireEnv(name: string): string {
@@ -46,23 +56,29 @@ function safeHttpUrl(value: unknown): string | null {
   if (typeof value !== "string" || !value.trim()) return null;
   try {
     const url = new URL(value.trim());
-    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : null;
+    return url.protocol === "http:" || url.protocol === "https:"
+      ? url.toString()
+      : null;
   } catch {
     return null;
   }
 }
 
-function getSourceUrl(articleRow: Record<string, unknown> | null): string | null {
+function getSourceUrl(
+  articleRow: Record<string, unknown> | null,
+): string | null {
   if (!articleRow) return null;
-  for (const key of [
-    "url",
-    "link",
-    "source_url",
-    "article_url",
-    "original_url",
-    "canonical_url",
-    "href",
-  ]) {
+  for (
+    const key of [
+      "url",
+      "link",
+      "source_url",
+      "article_url",
+      "original_url",
+      "canonical_url",
+      "href",
+    ]
+  ) {
     const url = safeHttpUrl(articleRow[key]);
     if (url) return url;
   }
@@ -74,7 +90,11 @@ function buildChannelPost(params: {
   summary: string;
   sourceUrl?: string | null;
 }): string {
-  const parts = [`<b>${escapeHtml(params.title)}</b>`, "", escapeHtml(params.summary)];
+  const parts = [
+    `<b>${escapeHtml(params.title)}</b>`,
+    "",
+    escapeHtml(params.summary),
+  ];
   if (params.sourceUrl) {
     parts.push("", `<a href="${escapeHtml(params.sourceUrl)}">Источник</a>`);
   }
@@ -82,11 +102,14 @@ function buildChannelPost(params: {
 }
 
 async function telegram(method: string, body: Record<string, unknown>) {
-  const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const response = await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/${method}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
   const result = await response.json();
   if (!response.ok || !result.ok) {
     throw new Error(`Telegram ${method} failed: ${JSON.stringify(result)}`);
@@ -120,8 +143,37 @@ async function editMessageReplyMarkup(
 
 function candidateKeyboard(queueId: number, revision: number) {
   return [[
-    { text: "✅ Опубликовать", callback_data: `publish:${queueId}:${revision}` },
-    { text: "❌ Не публиковать", callback_data: `reject:${queueId}:${revision}` },
+    {
+      text: "✅ Опубликовать",
+      callback_data: `publish:${queueId}:${revision}`,
+    },
+    {
+      text: "❌ Не публиковать",
+      callback_data: `reject:${queueId}:${revision}`,
+    },
+  ]];
+}
+
+function nextKeyboard(queueId: number, revision: number) {
+  return [[
+    {
+      text: "⏭ Следующая новость",
+      callback_data: `next:${queueId}:${revision}`,
+    },
+  ]];
+}
+
+function completedKeyboard(
+  label: string,
+  queueId: number,
+  revision: number,
+) {
+  return [[
+    { text: label, callback_data: "done" },
+    {
+      text: "⏭ Следующая новость",
+      callback_data: `next:${queueId}:${revision}`,
+    },
   ]];
 }
 
@@ -162,7 +214,7 @@ function parseCallbackData(raw: string): CallbackAction | null {
     return { kind: "prefilter", action, proposalId };
   }
 
-  if (["publish", "reject", "back"].includes(parts[0])) {
+  if (["publish", "reject", "back", "next"].includes(parts[0])) {
     const queueId = parsePositiveInteger(parts[1]);
     if (!queueId) return null;
 
@@ -174,6 +226,7 @@ function parseCallbackData(raw: string): CallbackAction | null {
     }
     if (parts[0] === "publish") return { kind: "publish", queueId, revision };
     if (parts[0] === "reject") return { kind: "reject", queueId, revision };
+    if (parts[0] === "next") return { kind: "next", queueId, revision };
     return { kind: "back", queueId, revision };
   }
 
@@ -182,7 +235,9 @@ function parseCallbackData(raw: string): CallbackAction | null {
     const queueId = parsePositiveInteger(parts[2]);
     const revision = parsePositiveInteger(parts[3]);
     if (
-      !["text_correction", "topic_mismatch", "other_rejection"].includes(feedbackType) ||
+      !["text_correction", "topic_mismatch", "other_rejection"].includes(
+        feedbackType,
+      ) ||
       !queueId ||
       !revision
     ) {
@@ -203,7 +258,9 @@ async function handlePrefilterProposal(
 ) {
   const { data: proposal, error } = await supabase
     .from("prefilter_policy_proposals")
-    .select("id,status,summary,rationale,policy,metrics,telegram_chat_id,telegram_message_id")
+    .select(
+      "id,status,summary,rationale,policy,metrics,telegram_chat_id,telegram_message_id",
+    )
     .eq("id", action.proposalId)
     .maybeSingle();
   if (error) throw error;
@@ -235,7 +292,10 @@ async function handlePrefilterProposal(
         "Отсекать: " + negative + "\n\n" +
         "Это только тематические сигналы; исправления языка сюда не входят."
       ).slice(0, 4000),
-      reply_parameters: { message_id: messageId, allow_sending_without_reply: true },
+      reply_parameters: {
+        message_id: messageId,
+        allow_sending_without_reply: true,
+      },
     });
     await answerCallbackQuery(callbackId, "Детали отправлены");
     return;
@@ -265,14 +325,18 @@ async function handlePrefilterProposal(
   ]]);
   await answerCallbackQuery(
     callbackId,
-    action.action === "activate" ? "Новый prefilter активирован" : "Предложение отклонено",
+    action.action === "activate"
+      ? "Новый prefilter активирован"
+      : "Предложение отклонено",
   );
 }
 
 async function getQueue(queueId: number): Promise<QueueRow | null> {
   const { data, error } = await supabase
     .from("editor_queue")
-    .select("id,article_id,status,revision,telegram_chat_id,telegram_message_id")
+    .select(
+      "id,article_id,status,revision,telegram_chat_id,telegram_message_id",
+    )
     .eq("id", queueId)
     .maybeSingle();
   if (error) throw error;
@@ -284,7 +348,10 @@ function callbackMatchesCurrentMessage(
   chatId: number,
   messageId: number,
 ): boolean {
-  if (queue.telegram_chat_id !== null && Number(queue.telegram_chat_id) !== Number(chatId)) {
+  if (
+    queue.telegram_chat_id !== null &&
+    Number(queue.telegram_chat_id) !== Number(chatId)
+  ) {
     return false;
   }
   if (
@@ -299,7 +366,8 @@ function callbackMatchesCurrentMessage(
 async function loadArticleAndAnalysis(articleId: number) {
   const [articleResult, analysisResult] = await Promise.all([
     supabase.from("articles").select("*").eq("id", articleId).single(),
-    supabase.from("article_analysis").select("*").eq("article_id", articleId).single(),
+    supabase.from("article_analysis").select("*").eq("article_id", articleId)
+      .single(),
   ]);
   if (articleResult.error) throw articleResult.error;
   if (analysisResult.error) throw analysisResult.error;
@@ -307,6 +375,251 @@ async function loadArticleAndAnalysis(articleId: number) {
     article: articleResult.data as Record<string, unknown>,
     analysis: analysisResult.data as Record<string, unknown>,
   };
+}
+
+async function deleteTelegramMessage(chatId: number, messageId: number) {
+  try {
+    await telegram("deleteMessage", { chat_id: chatId, message_id: messageId });
+  } catch (error) {
+    console.error("Failed to remove an unclaimed next-news copy:", error);
+  }
+}
+
+function buildEditorCandidate(params: {
+  articleId: number;
+  article: Record<string, unknown>;
+  analysis: Record<string, unknown>;
+  revision: number;
+}): string {
+  const title = String(
+    params.analysis.telegram_title || params.article.title || "Без заголовка",
+  ).trim();
+  const text = String(
+    params.analysis.telegram_text || params.analysis.russian_summary || "",
+  ).trim();
+  const category = String(params.analysis.category || "other");
+  const importance = String(params.analysis.importance_score || 0);
+  const candidateLabel = params.revision > 1
+    ? `♻️ <b>Исправленная версия ${params.revision}</b>`
+    : "📰 <b>Кандидат в публикацию</b>";
+  const parts = [
+    candidateLabel,
+    `<b>${escapeHtml(title)}</b>`,
+    "",
+    escapeHtml(text),
+    "",
+    `Категория: <b>${escapeHtml(category)}</b>`,
+    `Важность: <b>${escapeHtml(importance)}</b>/10`,
+    `Article ID: <code>${params.articleId}</code>`,
+  ];
+  const sourceUrl = getSourceUrl(params.article);
+  if (sourceUrl) {
+    parts.push(`Источник: <a href="${escapeHtml(sourceUrl)}">ссылка</a>`);
+  }
+  return parts.join("\n");
+}
+
+async function findNextSentCandidate(
+  chatId: number,
+  cursorMessageId: number,
+): Promise<QueueRow | null> {
+  const { data, error } = await supabase
+    .from("editor_queue")
+    .select(
+      "id,article_id,status,revision,telegram_chat_id,telegram_message_id",
+    )
+    .eq("status", "sent")
+    .eq("telegram_chat_id", chatId)
+    .gt("telegram_message_id", cursorMessageId)
+    .order("telegram_message_id", { ascending: true })
+    .order("id", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data as QueueRow | null;
+}
+
+async function findPendingCandidate(): Promise<QueueRow | null> {
+  const { data, error } = await supabase
+    .from("editor_queue")
+    .select(
+      "id,article_id,status,revision,telegram_chat_id,telegram_message_id",
+    )
+    .eq("status", "pending")
+    .order("id", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw error;
+  return data as QueueRow | null;
+}
+
+async function copyCandidateToBottom(
+  chatId: number,
+  candidate: QueueRow,
+): Promise<number> {
+  if (candidate.telegram_message_id === null) {
+    throw new Error(`Queue ${candidate.id} has no source Telegram message`);
+  }
+
+  try {
+    const copied = await telegram("copyMessage", {
+      chat_id: chatId,
+      from_chat_id: chatId,
+      message_id: candidate.telegram_message_id,
+      reply_markup: {
+        inline_keyboard: candidateKeyboard(candidate.id, candidate.revision),
+      },
+    });
+    const copiedMessageId = Number(copied.result?.message_id);
+    if (Number.isSafeInteger(copiedMessageId) && copiedMessageId > 0) {
+      return copiedMessageId;
+    }
+    throw new Error("Telegram copyMessage has no valid message_id");
+  } catch (copyError) {
+    // A deleted or otherwise uncopyable old message should not block the queue.
+    // Rebuild the candidate from the canonical article and analysis instead.
+    console.error(
+      "Could not copy the existing candidate; rebuilding it:",
+      copyError,
+    );
+    const { article, analysis } = await loadArticleAndAnalysis(
+      candidate.article_id,
+    );
+    const sent = await telegram("sendMessage", {
+      chat_id: chatId,
+      text: buildEditorCandidate({
+        articleId: candidate.article_id,
+        article,
+        analysis,
+        revision: candidate.revision,
+      }),
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: candidateKeyboard(candidate.id, candidate.revision),
+      },
+    });
+    const sentMessageId = Number(sent.result?.message_id);
+    if (!Number.isSafeInteger(sentMessageId) || sentMessageId <= 0) {
+      throw new Error("Telegram sendMessage has no valid message_id");
+    }
+    return sentMessageId;
+  }
+}
+
+async function sendPendingCandidate(
+  chatId: number,
+  candidate: QueueRow,
+): Promise<boolean> {
+  const { data: claimed, error: claimError } = await supabase
+    .from("editor_queue")
+    .update({ status: "notifying" })
+    .eq("id", candidate.id)
+    .eq("revision", candidate.revision)
+    .eq("status", "pending")
+    .select("id")
+    .maybeSingle();
+  if (claimError) throw claimError;
+  if (!claimed) return false;
+
+  let sentMessageId: number | null = null;
+  try {
+    const { article, analysis } = await loadArticleAndAnalysis(
+      candidate.article_id,
+    );
+    const sent = await telegram("sendMessage", {
+      chat_id: chatId,
+      text: buildEditorCandidate({
+        articleId: candidate.article_id,
+        article,
+        analysis,
+        revision: candidate.revision,
+      }),
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
+      reply_markup: {
+        inline_keyboard: candidateKeyboard(candidate.id, candidate.revision),
+      },
+    });
+    sentMessageId = Number(sent.result?.message_id);
+    if (!Number.isSafeInteger(sentMessageId) || sentMessageId <= 0) {
+      throw new Error("Telegram pending candidate has no valid message_id");
+    }
+
+    const { data: finalized, error: finalizeError } = await supabase
+      .from("editor_queue")
+      .update({
+        status: "sent",
+        telegram_chat_id: chatId,
+        telegram_message_id: sentMessageId,
+        last_sent_at: new Date().toISOString(),
+      })
+      .eq("id", candidate.id)
+      .eq("revision", candidate.revision)
+      .eq("status", "notifying")
+      .select("id")
+      .maybeSingle();
+    if (finalizeError) throw finalizeError;
+    if (!finalized) throw new Error("Pending candidate could not be finalized");
+    return true;
+  } catch (error) {
+    console.error("Sending pending next-news candidate failed:", error);
+    if (sentMessageId === null) {
+      await supabase
+        .from("editor_queue")
+        .update({ status: "pending" })
+        .eq("id", candidate.id)
+        .eq("revision", candidate.revision)
+        .eq("status", "notifying");
+    }
+    throw error;
+  }
+}
+
+type NextCandidateResult =
+  | { kind: "sent"; queueId: number }
+  | { kind: "pending"; queueId: number }
+  | { kind: "empty" }
+  | { kind: "busy" };
+
+async function sendNextCandidate(
+  chatId: number,
+  cursorMessageId: number,
+): Promise<NextCandidateResult> {
+  const sentCandidate = await findNextSentCandidate(chatId, cursorMessageId);
+  if (sentCandidate) {
+    const previousMessageId = sentCandidate.telegram_message_id;
+    if (previousMessageId === null) return { kind: "busy" };
+    const newMessageId = await copyCandidateToBottom(chatId, sentCandidate);
+    const { data: moved, error: moveError } = await supabase
+      .from("editor_queue")
+      .update({
+        telegram_message_id: newMessageId,
+        last_sent_at: new Date().toISOString(),
+      })
+      .eq("id", sentCandidate.id)
+      .eq("revision", sentCandidate.revision)
+      .eq("status", "sent")
+      .eq("telegram_message_id", previousMessageId)
+      .select("id")
+      .maybeSingle();
+    if (moveError) {
+      await deleteTelegramMessage(chatId, newMessageId);
+      throw moveError;
+    }
+    if (!moved) {
+      await deleteTelegramMessage(chatId, newMessageId);
+      return { kind: "busy" };
+    }
+    return { kind: "sent", queueId: sentCandidate.id };
+  }
+
+  const pendingCandidate = await findPendingCandidate();
+  if (!pendingCandidate) return { kind: "empty" };
+  const sent = await sendPendingCandidate(chatId, pendingCandidate);
+  return sent
+    ? { kind: "pending", queueId: pendingCandidate.id }
+    : { kind: "busy" };
 }
 
 async function publishCandidate(
@@ -333,12 +646,16 @@ async function publishCandidate(
   }
 
   try {
-    const { article, analysis } = await loadArticleAndAnalysis(queue.article_id);
+    const { article, analysis } = await loadArticleAndAnalysis(
+      queue.article_id,
+    );
     const title = String(
-      analysis.telegram_title || analysis.russian_summary || analysis.reason || "Новость",
+      analysis.telegram_title || analysis.russian_summary || analysis.reason ||
+        "Новость",
     );
     const summary = String(
-      analysis.telegram_text || analysis.russian_summary || "Текст новости недоступен.",
+      analysis.telegram_text || analysis.russian_summary ||
+        "Текст новости недоступен.",
     );
     const sourceUrl = getSourceUrl(article);
 
@@ -360,30 +677,35 @@ async function publishCandidate(
       .select("id")
       .maybeSingle();
     if (approveError) throw approveError;
-    if (!approved) throw new Error("Published queue item could not be finalized");
+    if (!approved) {
+      throw new Error("Published queue item could not be finalized");
+    }
 
-    const { error: feedbackError } = await supabase.from("editorial_feedback").insert({
-      queue_id: queue.id,
-      article_id: queue.article_id,
-      queue_revision: queue.revision,
-      feedback_type: "approved",
-      status: "applied",
-      telegram_chat_id: chatId,
-      telegram_user_id: callbackUserId,
-      source_title: article.title ?? null,
-      source_summary: article.summary ?? null,
-      draft_title: analysis.telegram_title ?? null,
-      draft_text: analysis.telegram_text ?? null,
-      submitted_at: reviewedAt,
-      processed_at: reviewedAt,
-    });
+    const { error: feedbackError } = await supabase.from("editorial_feedback")
+      .insert({
+        queue_id: queue.id,
+        article_id: queue.article_id,
+        queue_revision: queue.revision,
+        feedback_type: "approved",
+        status: "applied",
+        telegram_chat_id: chatId,
+        telegram_user_id: callbackUserId,
+        source_title: article.title ?? null,
+        source_summary: article.summary ?? null,
+        draft_title: analysis.telegram_title ?? null,
+        draft_text: analysis.telegram_text ?? null,
+        submitted_at: reviewedAt,
+        processed_at: reviewedAt,
+      });
     if (feedbackError && feedbackError.code !== "23505") {
       console.error("Failed to record approval feedback:", feedbackError);
     }
 
-    await editMessageReplyMarkup(chatId, messageId, [[
-      { text: "✅ Опубликовано", callback_data: "done" },
-    ]]);
+    await editMessageReplyMarkup(
+      chatId,
+      messageId,
+      completedKeyboard("✅ Опубликовано", queue.id, queue.revision),
+    );
     await answerCallbackQuery(callbackId, "Опубликовано");
   } catch (error) {
     console.error("Publish failed:", error);
@@ -459,29 +781,42 @@ async function returnToCandidate(
     .maybeSingle();
   if (error) throw error;
   if (!data) {
-    await answerCallbackQuery(callbackId, "Состояние новости уже изменилось", true);
+    await answerCallbackQuery(
+      callbackId,
+      "Состояние новости уже изменилось",
+      true,
+    );
     return;
   }
 
-  await editMessageReplyMarkup(chatId, messageId, candidateKeyboard(queue.id, queue.revision));
+  await editMessageReplyMarkup(
+    chatId,
+    messageId,
+    candidateKeyboard(queue.id, queue.revision),
+  );
   await answerCallbackQuery(callbackId, "Отмена");
 }
 
-function feedbackPrompt(type: FeedbackType): { text: string; placeholder: string } {
+function feedbackPrompt(
+  type: FeedbackType,
+): { text: string; placeholder: string } {
   if (type === "text_correction") {
     return {
-      text: "Что именно нужно исправить в описании или русском тексте? Ответьте на это сообщение одним комментарием.",
+      text:
+        "Что именно нужно исправить в описании или русском тексте? Ответьте на это сообщение одним комментарием.",
       placeholder: "Например: неверно указана дата…",
     };
   }
   if (type === "topic_mismatch") {
     return {
-      text: "Почему эта тема не подходит каналу? Ответьте на это сообщение — причина будет учтена при будущем отборе.",
+      text:
+        "Почему эта тема не подходит каналу? Ответьте на это сообщение — причина будет учтена при будущем отборе.",
       placeholder: "Например: слишком локальная политика…",
     };
   }
   return {
-    text: "Почему новость не должна публиковаться? Ответьте на это сообщение одним комментарием.",
+    text:
+      "Почему новость не должна публиковаться? Ответьте на это сообщение одним комментарием.",
     placeholder: "Например: устарела или повторяет другую…",
   };
 }
@@ -495,7 +830,11 @@ async function requestFeedbackComment(
   feedbackType: FeedbackType,
 ) {
   if (queue.status !== "awaiting_feedback") {
-    await answerCallbackQuery(callbackId, "Состояние новости уже изменилось", true);
+    await answerCallbackQuery(
+      callbackId,
+      "Состояние новости уже изменилось",
+      true,
+    );
     return;
   }
 
@@ -537,7 +876,10 @@ async function requestFeedbackComment(
     const promptResult = await telegram("sendMessage", {
       chat_id: chatId,
       text: prompt.text,
-      reply_parameters: { message_id: messageId, allow_sending_without_reply: true },
+      reply_parameters: {
+        message_id: messageId,
+        allow_sending_without_reply: true,
+      },
       reply_markup: {
         force_reply: true,
         selective: true,
@@ -551,22 +893,151 @@ async function requestFeedbackComment(
     }
     const { error: promptUpdateError } = await supabase
       .from("editorial_feedback")
-      .update({ prompt_message_id: promptMessageId, updated_at: new Date().toISOString() })
+      .update({
+        prompt_message_id: promptMessageId,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", feedback.id);
     if (promptUpdateError) throw promptUpdateError;
 
     await editMessageReplyMarkup(chatId, messageId, [[
       { text: "⏳ Жду комментарий", callback_data: "done" },
-      { text: "↩️ Отмена", callback_data: `back:${queue.id}:${queue.revision}` },
+      {
+        text: "↩️ Отмена",
+        callback_data: `back:${queue.id}:${queue.revision}`,
+      },
     ]]);
     await answerCallbackQuery(callbackId, "Напишите комментарий ответом боту");
   } catch (error) {
     await supabase
       .from("editorial_feedback")
-      .update({ status: "cancelled", error: String(error), updated_at: new Date().toISOString() })
+      .update({
+        status: "cancelled",
+        error: String(error),
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", feedback.id);
     throw error;
   }
+}
+
+async function handleNextCandidate(
+  callbackId: string,
+  chatId: number,
+  messageId: number,
+  action: Extract<CallbackAction, { kind: "next" }>,
+) {
+  const queue = await getQueue(action.queueId);
+  if (!queue) {
+    await answerCallbackQuery(callbackId, "Новость не найдена", true);
+    return;
+  }
+  if (
+    queue.telegram_chat_id !== null &&
+    Number(queue.telegram_chat_id) !== Number(chatId)
+  ) {
+    await answerCallbackQuery(callbackId, "Это неактуальная очередь", true);
+    return;
+  }
+
+  const expectedRevision = action.revision ?? queue.revision;
+  if (expectedRevision !== queue.revision) {
+    await answerCallbackQuery(callbackId, "Это старая версия новости", true);
+    return;
+  }
+  const cursorMessageId = queue.telegram_message_id;
+  if (cursorMessageId === null) {
+    await answerCallbackQuery(
+      callbackId,
+      "Для этой новости нет позиции в очереди",
+      true,
+    );
+    return;
+  }
+
+  // Disable the clicked button first. A second Telegram callback that arrives
+  // while the first one is copying a message will then be harmless.
+  try {
+    await editMessageReplyMarkup(chatId, messageId, [[
+      { text: "⏳ Открываю следующую…", callback_data: "done" },
+    ]]);
+  } catch (error) {
+    console.error("Could not disable next-news button:", error);
+  }
+
+  let result: NextCandidateResult;
+  try {
+    result = await sendNextCandidate(chatId, cursorMessageId);
+  } catch (error) {
+    console.error("Opening the next candidate failed:", error);
+    try {
+      await editMessageReplyMarkup(
+        chatId,
+        messageId,
+        nextKeyboard(queue.id, queue.revision),
+      );
+    } catch (restoreError) {
+      console.error("Could not restore next-news button:", restoreError);
+    }
+    await answerCallbackQuery(
+      callbackId,
+      "Не удалось открыть следующую новость",
+      true,
+    );
+    return;
+  }
+  if (result.kind === "empty") {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: "✅ Следующих необработанных новостей пока нет.",
+      reply_parameters: {
+        message_id: messageId,
+        allow_sending_without_reply: true,
+      },
+    });
+    await answerCallbackQuery(callbackId, "Очередь просмотрена");
+    return;
+  }
+  if (result.kind === "busy") {
+    try {
+      await editMessageReplyMarkup(
+        chatId,
+        messageId,
+        nextKeyboard(queue.id, queue.revision),
+      );
+    } catch (restoreError) {
+      console.error("Could not restore next-news button:", restoreError);
+    }
+    await answerCallbackQuery(
+      callbackId,
+      "Следующая новость уже открывается",
+      true,
+    );
+    return;
+  }
+  await answerCallbackQuery(callbackId, "Следующая новость отправлена");
+}
+
+async function handleNextCommand(
+  message: Record<string, any>,
+): Promise<boolean> {
+  const text = String(message.text || "").trim();
+  const chatId = Number(message.chat?.id);
+  if (!/^\/next(?:@[^\s]+)?$/i.test(text) || !chatId) return false;
+
+  const result = await sendNextCandidate(chatId, 0);
+  if (result.kind === "empty") {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: "✅ Следующих необработанных новостей пока нет.",
+    });
+  } else if (result.kind === "busy") {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: "⏳ Следующая новость уже открывается.",
+    });
+  }
+  return true;
 }
 
 async function handleCallback(callback: Record<string, any>) {
@@ -577,7 +1048,9 @@ async function handleCallback(callback: Record<string, any>) {
   const action = parseCallbackData(String(callback.data || ""));
 
   if (!action || !callbackId || !callbackUserId || !chatId || !messageId) {
-    if (callbackId) await answerCallbackQuery(callbackId, "Некорректная команда", true);
+    if (callbackId) {
+      await answerCallbackQuery(callbackId, "Некорректная команда", true);
+    }
     return;
   }
   if (action.kind === "done") {
@@ -592,6 +1065,10 @@ async function handleCallback(callback: Record<string, any>) {
       messageId,
       action,
     );
+    return;
+  }
+  if (action.kind === "next") {
+    await handleNextCandidate(callbackId, chatId, messageId, action);
     return;
   }
 
@@ -616,7 +1093,13 @@ async function handleCallback(callback: Record<string, any>) {
       await answerCallbackQuery(callbackId, "Эта новость уже обработана", true);
       return;
     }
-    await publishCandidate(callbackId, callbackUserId, chatId, messageId, queue);
+    await publishCandidate(
+      callbackId,
+      callbackUserId,
+      chatId,
+      messageId,
+      queue,
+    );
   } else if (action.kind === "reject") {
     await showRejectionReasons(callbackId, chatId, messageId, queue);
   } else if (action.kind === "back") {
@@ -696,11 +1179,23 @@ async function handleEditorComment(message: Record<string, any>) {
     ? "Принято. Новость отклонена, а причина будет учтена при будущем тематическом отборе."
     : "Принято. Новость отклонена; комментарий сохранён, но не меняет тематическую политику.";
 
-  await telegram("sendMessage", {
+  const acknowledgementPayload: Record<string, unknown> = {
     chat_id: chatId,
     text: acknowledgement,
-    reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
-  });
+    reply_parameters: {
+      message_id: message.message_id,
+      allow_sending_without_reply: true,
+    },
+  };
+  if (result !== "correction_pending") {
+    acknowledgementPayload.reply_markup = {
+      inline_keyboard: nextKeyboard(
+        Number(feedback.queue_id),
+        Number(feedback.queue_revision),
+      ),
+    };
+  }
+  await telegram("sendMessage", acknowledgementPayload);
 }
 
 Deno.serve(async (req) => {
@@ -713,7 +1208,9 @@ Deno.serve(async (req) => {
     if (payload.callback_query) {
       await handleCallback(payload.callback_query);
     } else if (payload.message) {
-      await handleEditorComment(payload.message);
+      if (!(await handleNextCommand(payload.message))) {
+        await handleEditorComment(payload.message);
+      }
     }
     return new Response("ok", { status: 200 });
   } catch (error) {

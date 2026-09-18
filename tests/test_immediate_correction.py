@@ -45,6 +45,16 @@ class ImmediateCorrectionTests(unittest.TestCase):
         self.assertIn('.eq("status", "pending")', notifier)
         self.assertIn("Telegram message sent but queue status was not finalized", notifier)
 
+    def test_editor_can_open_the_next_candidate_without_scrolling(self):
+        webhook = (ROOT / "supabase/functions/telegram-webhook/index.ts").read_text()
+        self.assertIn('{ kind: "next"; queueId: number; revision?: number }', webhook)
+        self.assertIn('callback_data: `next:${queueId}:${revision}`', webhook)
+        self.assertIn('telegram("copyMessage"', webhook)
+        self.assertIn('.gt("telegram_message_id", cursorMessageId)', webhook)
+        self.assertIn('status: "notifying"', webhook)
+        self.assertIn('^\\/next', webhook)
+        self.assertIn("Следующая новость отправлена", webhook)
+
 
 if __name__ == "__main__":
     unittest.main()

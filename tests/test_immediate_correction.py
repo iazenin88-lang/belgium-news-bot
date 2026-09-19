@@ -92,6 +92,8 @@ class ImmediateCorrectionTests(unittest.TestCase):
         self.assertIn('callback_data: `next:${queueId}:${revision}`', webhook)
         self.assertIn('telegram("copyMessage"', webhook)
         self.assertIn('.gt("telegram_message_id", cursorMessageId)', webhook)
+        self.assertIn("wrap to the oldest one", webhook)
+        self.assertIn("wrappedCandidate", webhook)
         self.assertIn('status: "notifying"', webhook)
         self.assertIn('^\\/next', webhook)
         self.assertIn("Следующая новость отправлена", webhook)

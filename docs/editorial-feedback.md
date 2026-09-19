@@ -48,6 +48,10 @@ current card, navigation wraps to the nearest unresolved candidate above it.
 Only when no already-sent candidate remains is the oldest `pending` row claimed
 and sent immediately. `/next` provides the same action without a button.
 
+When a candidate is copied, the previous card is marked as moved. If Telegram
+cannot update an older card, clicking that visible copy reactivates it as long
+as the queue revision is still current and no final decision has been recorded.
+
 Text-correction comments do not advance automatically: the corrected revision
 must arrive and remain subject to manual approval, preserving the immediate
 correction workflow.

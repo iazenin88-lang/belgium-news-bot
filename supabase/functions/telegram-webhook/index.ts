@@ -423,11 +423,11 @@ async function findNextSentCandidate(
   chatId: number,
   cursorMessageId: number,
 ): Promise<QueueRow | null> {
-  const { data, error } = await supabase
+  const fields =
+    "id,article_id,status,revision,telegram_chat_id,telegram_message_id";
+  const { data: laterCandidate, error: laterError } = await supabase
     .from("editor_queue")
-    .select(
-      "id,article_id,status,revision,telegram_chat_id,telegram_message_id",
-    )
+    .select(fields)
     .eq("status", "sent")
     .eq("telegram_chat_id", chatId)
     .gt("telegram_message_id", cursorMessageId)
@@ -435,8 +435,23 @@ async function findNextSentCandidate(
     .order("id", { ascending: true })
     .limit(1)
     .maybeSingle();
-  if (error) throw error;
-  return data as QueueRow | null;
+  if (laterError) throw laterError;
+  if (laterCandidate) return laterCandidate as QueueRow;
+
+  // The editor can process cards out of order. If every unresolved card is
+  // above the current message, wrap to the oldest one instead of reporting an
+  // empty queue.
+  const { data: wrappedCandidate, error: wrappedError } = await supabase
+    .from("editor_queue")
+    .select(fields)
+    .eq("status", "sent")
+    .eq("telegram_chat_id", chatId)
+    .order("telegram_message_id", { ascending: true })
+    .order("id", { ascending: true })
+    .limit(1)
+    .maybeSingle();
+  if (wrappedError) throw wrappedError;
+  return wrappedCandidate as QueueRow | null;
 }
 
 async function findPendingCandidate(): Promise<QueueRow | null> {

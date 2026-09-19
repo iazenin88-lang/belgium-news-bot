@@ -43,9 +43,10 @@ client's unread markers. After an approval or a non-correction rejection, the
 bot therefore offers `⏭ Следующая новость` at the bottom of the chat. The
 button selects the next still-`sent` candidate by its Telegram message order,
 copies it to the bottom with the normal publication buttons, and makes that
-copy the active callback message. If no already-sent candidate remains, the
-oldest `pending` row is claimed and sent immediately. `/next` provides the
-same action without a button.
+copy the active callback message. If no unresolved candidate exists below the
+current card, navigation wraps to the oldest unresolved candidate above it.
+Only when no already-sent candidate remains is the oldest `pending` row claimed
+and sent immediately. `/next` provides the same action without a button.
 
 Text-correction comments do not advance automatically: the corrected revision
 must arrive and remain subject to manual approval, preserving the immediate

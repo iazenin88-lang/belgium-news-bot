@@ -1,7 +1,10 @@
 from pathlib import Path
 import unittest
 
-from correction_pipeline import parse_feedback_id
+from correction_pipeline import (
+    load_pending_delivery_for_applied_feedback,
+    parse_feedback_id,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +17,44 @@ class ImmediateCorrectionTests(unittest.TestCase):
             parse_feedback_id("0")
         with self.assertRaises(ValueError):
             parse_feedback_id("not-a-number")
+
+    def test_applied_correction_can_retry_pending_telegram_delivery(self):
+        class Response:
+            def __init__(self, data):
+                self.data = data
+
+        class Query:
+            def __init__(self, table):
+                self.table = table
+                self.filters = {}
+
+            def select(self, _fields):
+                return self
+
+            def eq(self, field, value):
+                self.filters[field] = value
+                return self
+
+            def limit(self, _value):
+                return self
+
+            def execute(self):
+                if self.table == "editorial_feedback":
+                    row = {"id": 64, "queue_id": 959, "status": "applied"}
+                else:
+                    row = {"id": 959, "revision": 2, "status": "pending"}
+                if all(row.get(key) == value for key, value in self.filters.items()):
+                    return Response([row])
+                return Response([])
+
+        class Supabase:
+            def table(self, name):
+                return Query(name)
+
+        self.assertEqual(
+            load_pending_delivery_for_applied_feedback(Supabase(), 64),
+            {"feedback_id": 64, "queue_id": 959, "revision": 2},
+        )
 
     def test_workflow_runs_only_the_requested_correction(self):
         workflow = (ROOT / ".github/workflows/editorial_correction.yml").read_text()

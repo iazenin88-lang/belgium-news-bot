@@ -197,17 +197,19 @@ def notify_queue_item(
     article_id = int(queue_row["article_id"])
     revision = int(queue_row.get("revision") or 1)
 
-    claimed = (
+    # supabase-py returns an array from UPDATE ... RETURNING.  Do not use
+    # maybe_single(): current supabase-py versions do not expose it on this
+    # filtered update builder.
+    claimed_rows = (
         sb.table("editor_queue")
         .update({"status": "notifying"})
         .eq("id", queue_id)
         .eq("status", "pending")
         .eq("revision", revision)
         .select("id")
-        .maybe_single()
         .execute()
-    ).data
-    if not claimed:
+    ).data or []
+    if not claimed_rows:
         print(f"Skip queue_id={queue_id}: claimed by another notifier")
         return False
 
@@ -246,7 +248,7 @@ def notify_queue_item(
             raise RuntimeError("Telegram response has no message_id")
         telegram_sent = True
 
-        finalized = (
+        finalized_rows = (
             sb.table("editor_queue")
             .update({
                 "status": "sent",
@@ -258,10 +260,9 @@ def notify_queue_item(
             .eq("status", "notifying")
             .eq("revision", revision)
             .select("id")
-            .maybe_single()
             .execute()
-        ).data
-        if not finalized:
+        ).data or []
+        if not finalized_rows:
             raise RuntimeError("Telegram message sent but queue status was not finalized")
 
         print(f"Sent queue_id={queue_id} revision={revision}")

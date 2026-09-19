@@ -439,15 +439,16 @@ async function findNextSentCandidate(
   if (laterCandidate) return laterCandidate as QueueRow;
 
   // The editor can process cards out of order. If every unresolved card is
-  // above the current message, wrap to the oldest one instead of reporting an
-  // empty queue.
+  // above the current message, wrap to the nearest one above instead of
+  // reporting an empty queue or jumping to the start of the chat history.
   const { data: wrappedCandidate, error: wrappedError } = await supabase
     .from("editor_queue")
     .select(fields)
     .eq("status", "sent")
     .eq("telegram_chat_id", chatId)
-    .order("telegram_message_id", { ascending: true })
-    .order("id", { ascending: true })
+    .lt("telegram_message_id", cursorMessageId)
+    .order("telegram_message_id", { ascending: false })
+    .order("id", { ascending: false })
     .limit(1)
     .maybeSingle();
   if (wrappedError) throw wrappedError;

@@ -44,7 +44,7 @@ bot therefore offers `⏭ Следующая новость` at the bottom of th
 button selects the next still-`sent` candidate by its Telegram message order,
 copies it to the bottom with the normal publication buttons, and makes that
 copy the active callback message. If no unresolved candidate exists below the
-current card, navigation wraps to the oldest unresolved candidate above it.
+current card, navigation wraps to the nearest unresolved candidate above it.
 Only when no already-sent candidate remains is the oldest `pending` row claimed
 and sent immediately. `/next` provides the same action without a button.
 

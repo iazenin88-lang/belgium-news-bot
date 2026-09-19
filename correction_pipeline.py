@@ -22,6 +22,42 @@ def parse_feedback_id(value: str) -> int:
     return feedback_id
 
 
+def load_pending_delivery_for_applied_feedback(sb, feedback_id: int) -> dict | None:
+    """Find a corrected queue row whose Telegram delivery can be retried.
+
+    Correction is committed before Telegram is called. If the runner crashes
+    after that commit, a retry must deliver the existing revision instead of
+    trying to run the AI correction a second time.
+    """
+    feedback_rows = (
+        sb.table("editorial_feedback")
+        .select("queue_id,status")
+        .eq("id", feedback_id)
+        .limit(1)
+        .execute()
+    ).data or []
+    if not feedback_rows or feedback_rows[0].get("status") != "applied":
+        return None
+
+    queue_id = int(feedback_rows[0]["queue_id"])
+    queue_rows = (
+        sb.table("editor_queue")
+        .select("id,revision,status")
+        .eq("id", queue_id)
+        .eq("status", "pending")
+        .limit(1)
+        .execute()
+    ).data or []
+    if not queue_rows:
+        return None
+
+    return {
+        "feedback_id": feedback_id,
+        "queue_id": queue_id,
+        "revision": int(queue_rows[0].get("revision") or 1),
+    }
+
+
 def run_correction(feedback_id: int) -> bool:
     """Correct one pending request, account for it, and notify the editor."""
     # Imports are deferred so the small input validator remains testable
@@ -74,12 +110,21 @@ def run_correction(feedback_id: int) -> bool:
 
     if stats["failed"] or stats["quota_error"]:
         raise RuntimeError(f"Correction failed for feedback_id={feedback_id}")
-    if not stats["processed_items"]:
-        # A retried workflow can legitimately find an already-applied request.
-        print(f"No pending correction remains for feedback_id={feedback_id}")
-        return False
+    if stats["processed_items"]:
+        item = stats["processed_items"][0]
+    else:
+        # The AI transaction may have committed before Telegram delivery
+        # failed. In that case the correction is already applied and only the
+        # pending queue delivery should be retried.
+        item = load_pending_delivery_for_applied_feedback(sb, feedback_id)
+        if item is None:
+            print(f"No pending correction delivery remains for feedback_id={feedback_id}")
+            return False
+        print(
+            f"Retrying Telegram delivery for applied correction "
+            f"feedback_id={feedback_id} queue_id={item['queue_id']}"
+        )
 
-    item = stats["processed_items"][0]
     queue_id = int(item["queue_id"])
     sent = notify_queue_item(
         sb,

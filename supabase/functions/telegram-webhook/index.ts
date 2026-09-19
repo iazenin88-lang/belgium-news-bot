@@ -343,22 +343,55 @@ async function getQueue(queueId: number): Promise<QueueRow | null> {
   return data as QueueRow | null;
 }
 
-function callbackMatchesCurrentMessage(
+function callbackBelongsToChat(
+  queue: QueueRow,
+  chatId: number,
+): boolean {
+  return !(
+    queue.telegram_chat_id !== null &&
+    Number(queue.telegram_chat_id) !== Number(chatId)
+  );
+}
+
+async function activateCallbackMessage(
   queue: QueueRow,
   chatId: number,
   messageId: number,
-): boolean {
-  if (
-    queue.telegram_chat_id !== null &&
-    Number(queue.telegram_chat_id) !== Number(chatId)
-  ) {
-    return false;
-  }
-  if (
-    queue.telegram_message_id !== null &&
-    Number(queue.telegram_message_id) !== Number(messageId)
-  ) {
-    return false;
+): Promise<boolean> {
+  if (!callbackBelongsToChat(queue, chatId)) return false;
+  if (Number(queue.telegram_message_id) === Number(messageId)) return true;
+
+  // A candidate can have several visible Telegram copies after navigation.
+  // Any copy of the current revision remains valid while the queue item is
+  // still interactive. Make the clicked copy active instead of rejecting an
+  // editor decision as "stale".
+  if (!["sent", "awaiting_feedback"].includes(queue.status)) return true;
+
+  const previousMessageId = queue.telegram_message_id;
+  const { data: activated, error } = await supabase
+    .from("editor_queue")
+    .update({
+      telegram_chat_id: chatId,
+      telegram_message_id: messageId,
+    })
+    .eq("id", queue.id)
+    .eq("revision", queue.revision)
+    .eq("status", queue.status)
+    .select("id")
+    .maybeSingle();
+  if (error) throw error;
+  if (!activated) return false;
+
+  queue.telegram_chat_id = chatId;
+  queue.telegram_message_id = messageId;
+  if (previousMessageId !== null && previousMessageId !== messageId) {
+    try {
+      await editMessageReplyMarkup(chatId, previousMessageId, [[
+        { text: "↪️ Открыто в другой карточке", callback_data: "done" },
+      ]]);
+    } catch (editError) {
+      console.error("Could not retire the previous active copy:", editError);
+    }
   }
   return true;
 }
@@ -626,6 +659,15 @@ async function sendNextCandidate(
     if (!moved) {
       await deleteTelegramMessage(chatId, newMessageId);
       return { kind: "busy" };
+    }
+    try {
+      await editMessageReplyMarkup(chatId, previousMessageId, [[
+        { text: "↪️ Открыто ниже", callback_data: "done" },
+      ]]);
+    } catch (editError) {
+      // The new copy is already active in the database. If Telegram cannot
+      // retire the old buttons, activateCallbackMessage still makes them safe.
+      console.error("Could not retire the moved candidate copy:", editError);
     }
     return { kind: "sent", queueId: sentCandidate.id };
   }
@@ -1093,14 +1135,22 @@ async function handleCallback(callback: Record<string, any>) {
     await answerCallbackQuery(callbackId, "Новость не найдена", true);
     return;
   }
-  if (!callbackMatchesCurrentMessage(queue, chatId, messageId)) {
-    await answerCallbackQuery(callbackId, "Это неактуальное сообщение", true);
+  if (!callbackBelongsToChat(queue, chatId)) {
+    await answerCallbackQuery(callbackId, "Это неактуальная очередь", true);
     return;
   }
 
   const expectedRevision = action.revision ?? queue.revision;
   if (expectedRevision !== queue.revision) {
     await answerCallbackQuery(callbackId, "Это старая версия новости", true);
+    return;
+  }
+  if (!(await activateCallbackMessage(queue, chatId, messageId))) {
+    await answerCallbackQuery(
+      callbackId,
+      "Состояние новости уже изменилось",
+      true,
+    );
     return;
   }
 

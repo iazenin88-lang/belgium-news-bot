@@ -2,6 +2,11 @@ name: Full news pipeline
 
 on:
   workflow_dispatch:
+    inputs:
+      brussels_times_backfill_urls:
+        description: "Optional Brussels Times URLs to backfill, one per line (max 20)"
+        required: false
+        type: string
 
 concurrency:
   group: full-news-pipeline
@@ -52,6 +57,15 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
         run: |
           python collector.py
+
+      - name: Backfill explicitly requested Brussels Times URLs
+        if: steps.schedule_gate.outputs.run == 'true' && inputs.brussels_times_backfill_urls != ''
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          BRUSSELS_TIMES_BACKFILL_URLS: ${{ inputs.brussels_times_backfill_urls }}
+        run: |
+          python backfill_brussels_times.py
 
       - name: Run analyzer
         if: steps.schedule_gate.outputs.run == 'true'

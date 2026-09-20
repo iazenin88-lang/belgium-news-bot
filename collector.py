@@ -38,7 +38,7 @@ BRUSSELS_TIMES_DOMAIN = "brusselstimes.com"
 BRUSSELS_TIMES_ARTICLE_API = "https://apiv2.brusselstimes.com/article"
 BRUSSELS_TIMES_ENTRY_LIMIT = max(
     1,
-    int(os.getenv("BRUSSELS_TIMES_ENTRY_LIMIT", "40")),
+    int(os.getenv("BRUSSELS_TIMES_ENTRY_LIMIT", "120")),
 )
 
 SITEMAP_NAMESPACE = "http://www.sitemaps.org/schemas/sitemap/0.9"
@@ -235,11 +235,11 @@ def clean_summary(value: str | None) -> str | None:
     return text[:4000] or None
 
 
-def extract_brussels_times_summary(
+def fetch_brussels_times_article(
     url: str,
     session: requests.Session,
-) -> str | None:
-    """Fetch only the publisher-provided abstract, never the full article body."""
+) -> dict | None:
+    """Fetch validated metadata for one Brussels Times article ID."""
     article_id = brussels_times_article_id(url)
     if article_id is None:
         return None
@@ -260,6 +260,17 @@ def extract_brussels_times_summary(
         return None
     response_id = payload.get("id")
     if response_id is not None and str(response_id) != str(article_id):
+        return None
+    return payload
+
+
+def extract_brussels_times_summary(
+    url: str,
+    session: requests.Session,
+) -> str | None:
+    """Fetch only the publisher-provided abstract, never the full article body."""
+    payload = fetch_brussels_times_article(url, session)
+    if payload is None:
         return None
 
     return (

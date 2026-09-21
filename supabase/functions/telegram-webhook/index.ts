@@ -650,6 +650,9 @@ async function sendNextCandidate(
   cursorMessageId: number,
 ): Promise<NextCandidateResult> {
   const remainingCount = await countRemainingCandidates(chatId);
+  // The card itself is already being shown to the editor.  The counter must
+  // describe only the candidates that will remain after this one.
+  const remainingAfterCurrent = Math.max(remainingCount - 1, 0);
   const sentCandidate = await findNextSentCandidate(chatId, cursorMessageId);
   if (sentCandidate) {
     const previousMessageId = sentCandidate.telegram_message_id;
@@ -657,7 +660,7 @@ async function sendNextCandidate(
     const newMessageId = await copyCandidateToBottom(
       chatId,
       sentCandidate,
-      remainingCount,
+      remainingAfterCurrent,
     );
     const { data: moved, error: moveError } = await supabase
       .from("editor_queue")
@@ -696,7 +699,7 @@ async function sendNextCandidate(
   const sent = await sendPendingCandidate(
     chatId,
     pendingCandidate,
-    remainingCount,
+    remainingAfterCurrent,
   );
   return sent
     ? { kind: "pending", queueId: pendingCandidate.id }

@@ -13,6 +13,36 @@ MAX_TERMS = 30
 MAX_TRAINING_EXAMPLES = 200
 MAX_TRAINING_PROMPT_CHARS = 100_000
 
+PROPOSAL_TEXT_FORMAT = {
+    "format": {
+        "type": "json_schema",
+        "name": "prefilter_policy_proposal",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string"},
+                "rationale": {"type": "string"},
+                "positive_terms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "negative_terms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+            },
+            "required": [
+                "summary",
+                "rationale",
+                "positive_terms",
+                "negative_terms",
+            ],
+            "additionalProperties": False,
+        },
+    }
+}
+
 TERM_STOPWORDS = {
     "about", "after", "against", "also", "before", "belgian", "belgium",
     "from", "have", "into", "more", "new", "says", "that", "their",
@@ -58,6 +88,11 @@ def parse_policy_proposal(raw: str) -> dict[str, Any]:
     if text.startswith(fence):
         text = text.removeprefix(fence + "json").removeprefix(fence)
         text = text.removesuffix(fence).strip()
+    if not text.startswith("{"):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start >= 0 and end > start:
+            text = text[start:end + 1]
     data = json.loads(text)
 
     def terms(name: str) -> list[str]:

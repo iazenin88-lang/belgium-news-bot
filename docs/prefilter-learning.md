@@ -16,6 +16,12 @@ retries immediately with the measured retention and rejection coverage. Terms
 that occur in any approved item are removed from the negative list before the
 replay.
 
+If generated terms still cover less than 20% of topic declines, a deterministic
+fallback greedily adds exact words or short phrases from declined source text.
+Fallback terms are rejected when they occur in any approved source. This makes
+proposal generation complete without weakening the 95% approval-retention gate;
+the editor still sees replay metrics and must activate the policy.
+
 The editor can inspect, activate, or reject the proposal in the editor chat.
 Activation ends exploration mode and is atomic. Every proposal and decision is
 versioned in the database.

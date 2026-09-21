@@ -92,6 +92,11 @@ class ImmediateCorrectionTests(unittest.TestCase):
         self.assertIn('callback_data: `next:${queueId}:${revision}`', webhook)
         self.assertIn("countRemainingCandidates", webhook)
         self.assertIn("Осталось согласовать", webhook)
+        self.assertIn(
+            "const remainingAfterCurrent = Math.max(remainingCount - 1, 0)",
+            webhook,
+        )
+        self.assertEqual(webhook.count("remainingAfterCurrent,"), 2)
         self.assertIn('select("id", { count: "exact", head: true })', webhook)
         self.assertIn('.gt("telegram_message_id", cursorMessageId)', webhook)
         self.assertIn("wrap to the nearest one above", webhook)

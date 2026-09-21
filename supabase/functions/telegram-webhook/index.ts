@@ -423,6 +423,7 @@ function buildEditorCandidate(params: {
   article: Record<string, unknown>;
   analysis: Record<string, unknown>;
   revision: number;
+  remainingCount?: number;
 }): string {
   const title = String(
     params.analysis.telegram_title || params.article.title || "Без заголовка",
@@ -449,7 +450,30 @@ function buildEditorCandidate(params: {
   if (sourceUrl) {
     parts.push(`Источник: <a href="${escapeHtml(sourceUrl)}">ссылка</a>`);
   }
+  if (params.remainingCount !== undefined) {
+    parts.push(
+      "",
+      `📋 Осталось согласовать: <b>${params.remainingCount}</b>`,
+    );
+  }
   return parts.join("\n");
+}
+
+async function countRemainingCandidates(chatId: number): Promise<number> {
+  const [pendingResult, activeResult] = await Promise.all([
+    supabase
+      .from("editor_queue")
+      .select("id", { count: "exact", head: true })
+      .eq("status", "pending"),
+    supabase
+      .from("editor_queue")
+      .select("id", { count: "exact", head: true })
+      .eq("telegram_chat_id", chatId)
+      .in("status", ["sent", "awaiting_feedback", "notifying"]),
+  ]);
+  if (pendingResult.error) throw pendingResult.error;
+  if (activeResult.error) throw activeResult.error;
+  return Number(pendingResult.count || 0) + Number(activeResult.count || 0);
 }
 
 async function findNextSentCandidate(
@@ -505,16 +529,27 @@ async function findPendingCandidate(): Promise<QueueRow | null> {
 async function copyCandidateToBottom(
   chatId: number,
   candidate: QueueRow,
+  remainingCount: number,
 ): Promise<number> {
   if (candidate.telegram_message_id === null) {
     throw new Error(`Queue ${candidate.id} has no source Telegram message`);
   }
 
   try {
-    const copied = await telegram("copyMessage", {
+    const { article, analysis } = await loadArticleAndAnalysis(
+      candidate.article_id,
+    );
+    const copied = await telegram("sendMessage", {
       chat_id: chatId,
-      from_chat_id: chatId,
-      message_id: candidate.telegram_message_id,
+      text: buildEditorCandidate({
+        articleId: candidate.article_id,
+        article,
+        analysis,
+        revision: candidate.revision,
+        remainingCount,
+      }),
+      parse_mode: "HTML",
+      disable_web_page_preview: true,
       reply_markup: {
         inline_keyboard: candidateKeyboard(candidate.id, candidate.revision),
       },
@@ -523,42 +558,20 @@ async function copyCandidateToBottom(
     if (Number.isSafeInteger(copiedMessageId) && copiedMessageId > 0) {
       return copiedMessageId;
     }
-    throw new Error("Telegram copyMessage has no valid message_id");
+    throw new Error("Telegram sendMessage has no valid message_id");
   } catch (copyError) {
-    // A deleted or otherwise uncopyable old message should not block the queue.
-    // Rebuild the candidate from the canonical article and analysis instead.
     console.error(
-      "Could not copy the existing candidate; rebuilding it:",
+      "Could not rebuild the existing candidate:",
       copyError,
     );
-    const { article, analysis } = await loadArticleAndAnalysis(
-      candidate.article_id,
-    );
-    const sent = await telegram("sendMessage", {
-      chat_id: chatId,
-      text: buildEditorCandidate({
-        articleId: candidate.article_id,
-        article,
-        analysis,
-        revision: candidate.revision,
-      }),
-      parse_mode: "HTML",
-      disable_web_page_preview: true,
-      reply_markup: {
-        inline_keyboard: candidateKeyboard(candidate.id, candidate.revision),
-      },
-    });
-    const sentMessageId = Number(sent.result?.message_id);
-    if (!Number.isSafeInteger(sentMessageId) || sentMessageId <= 0) {
-      throw new Error("Telegram sendMessage has no valid message_id");
-    }
-    return sentMessageId;
+    throw copyError;
   }
 }
 
 async function sendPendingCandidate(
   chatId: number,
   candidate: QueueRow,
+  remainingCount: number,
 ): Promise<boolean> {
   const { data: claimed, error: claimError } = await supabase
     .from("editor_queue")
@@ -583,6 +596,7 @@ async function sendPendingCandidate(
         article,
         analysis,
         revision: candidate.revision,
+        remainingCount,
       }),
       parse_mode: "HTML",
       disable_web_page_preview: true,
@@ -635,11 +649,16 @@ async function sendNextCandidate(
   chatId: number,
   cursorMessageId: number,
 ): Promise<NextCandidateResult> {
+  const remainingCount = await countRemainingCandidates(chatId);
   const sentCandidate = await findNextSentCandidate(chatId, cursorMessageId);
   if (sentCandidate) {
     const previousMessageId = sentCandidate.telegram_message_id;
     if (previousMessageId === null) return { kind: "busy" };
-    const newMessageId = await copyCandidateToBottom(chatId, sentCandidate);
+    const newMessageId = await copyCandidateToBottom(
+      chatId,
+      sentCandidate,
+      remainingCount,
+    );
     const { data: moved, error: moveError } = await supabase
       .from("editor_queue")
       .update({
@@ -674,7 +693,11 @@ async function sendNextCandidate(
 
   const pendingCandidate = await findPendingCandidate();
   if (!pendingCandidate) return { kind: "empty" };
-  const sent = await sendPendingCandidate(chatId, pendingCandidate);
+  const sent = await sendPendingCandidate(
+    chatId,
+    pendingCandidate,
+    remainingCount,
+  );
   return sent
     ? { kind: "pending", queueId: pendingCandidate.id }
     : { kind: "busy" };

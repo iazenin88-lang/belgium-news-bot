@@ -1577,7 +1577,7 @@ def maybe_create_prefilter_proposal(
 
     assert policy is not None and metrics is not None
 
-    inserted = sb.table("prefilter_policy_proposals").insert({
+    inserted_rows = sb.table("prefilter_policy_proposals").insert({
         "summary": policy["summary"],
         "rationale": policy["rationale"],
         "policy": {
@@ -1589,7 +1589,10 @@ def maybe_create_prefilter_proposal(
         "training_approvals": approvals,
         "training_topic_declines": declines,
         "model": MODEL,
-    }).select("id").single().execute().data
+    }).select("id").execute().data or []
+    if not inserted_rows:
+        raise RuntimeError("Prefilter proposal insert returned no row")
+    inserted = inserted_rows[0]
     proposal_id = int(inserted["id"])
 
     retention = round(float(metrics["approval_retention"]) * 100)

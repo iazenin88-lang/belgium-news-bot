@@ -16,6 +16,10 @@ retries immediately with the measured retention and rejection coverage. Terms
 that occur in any approved item are removed from the negative list before the
 replay.
 
+The OpenAI Responses call uses strict JSON Schema output. A malformed response
+is still treated as a retryable proposal attempt rather than aborting the whole
+learning step.
+
 If generated terms still cover less than 20% of topic declines, a deterministic
 fallback greedily adds exact words or short phrases from declined source text.
 Fallback terms are rejected when they occur in any approved source. This makes

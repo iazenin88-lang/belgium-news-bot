@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import re
+from collections import defaultdict
 from typing import Any, Iterable
 
 
@@ -10,6 +12,18 @@ MIN_TRAINING_DECISIONS = 50
 MAX_TERMS = 30
 MAX_TRAINING_EXAMPLES = 200
 MAX_TRAINING_PROMPT_CHARS = 100_000
+
+TERM_STOPWORDS = {
+    "about", "after", "against", "also", "before", "belgian", "belgium",
+    "from", "have", "into", "more", "new", "says", "that", "their",
+    "there", "these", "this", "were", "will", "with",
+    "aan", "als", "bij", "daar", "deze", "door", "heeft", "maar", "meer",
+    "naar", "niet", "nieuwe", "onder", "over", "tegen", "voor", "wordt",
+    "zijn", "zich",
+    "après", "avant", "avec", "belgique", "dans", "elle", "pour", "plus",
+    "sont", "cette",
+    "deutschland", "mehr", "nach", "sind", "über", "gegen",
+}
 
 PROPOSAL_SYSTEM_PROMPT = """
 Ты предлагаешь безопасное обновление предварительного фильтра новостей
@@ -200,3 +214,116 @@ def remove_unsafe_negative_terms(
         if not any(term in text for text in approved_texts)
     ]
     return {**policy, "negative_terms": safe_negative}
+
+
+def _source_terms(text: str) -> set[str]:
+    """Return exact reusable words and short phrases from an article."""
+    words = re.findall(r"[^\W\d_][\w'’-]*", text.lower(), flags=re.UNICODE)
+    words = [word.strip("'’-") for word in words if word.strip("'’-")]
+    terms = {
+        word
+        for word in words
+        if len(word) >= 5 and word not in TERM_STOPWORDS
+    }
+    for size in (2, 3):
+        for index in range(len(words) - size + 1):
+            phrase_words = words[index:index + size]
+            phrase = " ".join(phrase_words)
+            if (
+                len(phrase) <= 80
+                and any(
+                    len(word) >= 5 and word not in TERM_STOPWORDS
+                    for word in phrase_words
+                )
+            ):
+                terms.add(phrase)
+    return terms
+
+
+def complete_policy_coverage(
+    rows: Iterable[dict[str, Any]],
+    policy: dict[str, Any],
+    minimum_decline_rejection: float = 0.20,
+) -> dict[str, Any]:
+    """Complete an AI proposal with exact, replay-safe source phrases."""
+    labelled = [
+        row
+        for row in rows
+        if row.get("feedback_type") in ("approved", "topic_mismatch")
+        and row.get("status") == "applied"
+    ]
+    approved_texts = [
+        decision_text(row)
+        for row in labelled
+        if row.get("feedback_type") == "approved"
+    ]
+    declined_texts = [
+        decision_text(row)
+        for row in labelled
+        if row.get("feedback_type") == "topic_mismatch"
+    ]
+    if not approved_texts or not declined_texts:
+        return policy
+
+    # A positive signal overrides a negative one, so keep only positive terms
+    # that are exclusive to the approved history.
+    positive_terms = [
+        term
+        for term in policy.get("positive_terms", [])
+        if any(term in text for text in approved_texts)
+        and not any(term in text for text in declined_texts)
+    ][:MAX_TERMS]
+
+    coverage: dict[str, set[int]] = defaultdict(set)
+    for index, text in enumerate(declined_texts):
+        for term in _source_terms(text):
+            if not any(term in approved for approved in approved_texts):
+                coverage[term].add(index)
+
+    existing = [
+        term
+        for term in policy.get("negative_terms", [])
+        if term in coverage
+    ]
+    negative_terms: list[str] = []
+    covered: set[int] = set()
+    for term in sorted(existing, key=lambda item: (-len(coverage[item]), len(item))):
+        if term not in negative_terms:
+            negative_terms.append(term)
+            covered.update(coverage[term])
+
+    target = max(
+        1,
+        int(len(declined_texts) * minimum_decline_rejection + 0.9999),
+    )
+    candidates = set(coverage) - set(negative_terms)
+    while len(covered) < target and candidates and len(negative_terms) < MAX_TERMS:
+        best = max(
+            candidates,
+            key=lambda term: (
+                len(coverage[term] - covered),
+                len(coverage[term]),
+                -len(term.split()),
+                -len(term),
+            ),
+        )
+        candidates.remove(best)
+        if not (coverage[best] - covered):
+            break
+        negative_terms.append(best)
+        covered.update(coverage[best])
+
+    added = [term for term in negative_terms if term not in existing]
+    rationale = str(policy.get("rationale") or "").strip()
+    if added:
+        rationale = (
+            rationale
+            + " Историческая проверка дополнила список точными признаками "
+            "из отклонённых источников, отсутствующими в одобренных."
+        ).strip()[:3000]
+    return {
+        **policy,
+        "rationale": rationale,
+        "positive_terms": positive_terms,
+        "negative_terms": negative_terms[:MAX_TERMS],
+    }

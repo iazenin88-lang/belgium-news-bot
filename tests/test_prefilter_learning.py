@@ -2,6 +2,7 @@ import json
 import unittest
 
 from prefilter_learning import (
+    complete_policy_coverage,
     evaluate_policy,
     parse_policy_proposal,
     policy_prefilter_decision,
@@ -107,6 +108,49 @@ class PrefilterLearningTests(unittest.TestCase):
             "negative_terms": ["school", "football"],
         })
         self.assertEqual(policy["negative_terms"], ["football"])
+
+    def test_policy_coverage_is_completed_with_safe_source_terms(self):
+        rows = [{
+            "status": "applied",
+            "feedback_type": "approved",
+            "source_title": "Belgian rent rules for families",
+        }]
+        rows.extend({
+            "status": "applied",
+            "feedback_type": "topic_mismatch",
+            "source_title": f"International football championship match {index}",
+        } for index in range(10))
+        policy = complete_policy_coverage(rows, {
+            "summary": "Reduce sport",
+            "rationale": "Repeated sport declines",
+            "positive_terms": ["rent rules", "international"],
+            "negative_terms": [],
+        })
+        metrics = evaluate_policy(rows, policy)
+        self.assertGreaterEqual(metrics["approval_retention"], 0.95)
+        self.assertGreaterEqual(metrics["decline_rejection"], 0.20)
+        self.assertNotIn("international", policy["positive_terms"])
+        self.assertTrue(policy["negative_terms"])
+
+    def test_coverage_terms_never_appear_in_approved_sources(self):
+        rows = [{
+            "status": "applied",
+            "feedback_type": "approved",
+            "source_title": "Belgian school reform",
+        }, {
+            "status": "applied",
+            "feedback_type": "topic_mismatch",
+            "source_title": "Local school football match",
+        }]
+        policy = complete_policy_coverage(rows, {
+            "summary": "Reduce sport",
+            "rationale": "Sport decline",
+            "positive_terms": [],
+            "negative_terms": [],
+        })
+        self.assertNotIn("school", policy["negative_terms"])
+        metrics = evaluate_policy(rows, policy)
+        self.assertEqual(metrics["approval_retention"], 1.0)
 
 
 if __name__ == "__main__":

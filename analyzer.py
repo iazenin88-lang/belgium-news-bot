@@ -38,6 +38,7 @@ from editorial_feedback import (
 )
 from prefilter_learning import (
     PROPOSAL_SYSTEM_PROMPT,
+    complete_policy_coverage,
     evaluate_policy,
     format_training_examples,
     parse_policy_proposal,
@@ -1539,8 +1540,11 @@ def maybe_create_prefilter_proposal(
         input_tokens += attempt_input
         output_tokens += attempt_output
         cost = quantize_money(cost + calc_cost_usd(attempt_input, attempt_output))
-        policy = remove_unsafe_negative_terms(
-            rows, parse_policy_proposal(pick_text(response))
+        policy = complete_policy_coverage(
+            rows,
+            remove_unsafe_negative_terms(
+                rows, parse_policy_proposal(pick_text(response))
+            ),
         )
         metrics = evaluate_policy(rows, policy)
         if proposal_is_safe(metrics):

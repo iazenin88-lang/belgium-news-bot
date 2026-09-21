@@ -23,6 +23,17 @@ class PrefilterLearningTests(unittest.TestCase):
         self.assertEqual(policy["positive_terms"], ["rent indexation"])
         self.assertEqual(policy["negative_terms"], ["local football"])
 
+    def test_parser_extracts_json_after_explanatory_prefix(self):
+        policy = parse_policy_proposal(
+            "Here is the proposal:\n" + json.dumps({
+                "summary": "Reduce sport",
+                "rationale": "Repeated declines",
+                "positive_terms": [],
+                "negative_terms": ["football"],
+            })
+        )
+        self.assertEqual(policy["negative_terms"], ["football"])
+
     def test_positive_signal_overrides_negative_signal(self):
         decision, _ = policy_prefilter_decision(
             "New rent rule after a local football event",

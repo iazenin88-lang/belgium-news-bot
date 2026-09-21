@@ -10,6 +10,12 @@ bounded positive and negative phrases. The analyzer replays the proposal
 against the labelled history and requires at least 95% approval retention
 before sending it to Telegram.
 
+The proposal prompt includes a balanced view of the labelled history instead
+of only the first few newest records. If a candidate fails replay, the analyzer
+retries immediately with the measured retention and rejection coverage. Terms
+that occur in any approved item are removed from the negative list before the
+replay.
+
 The editor can inspect, activate, or reject the proposal in the editor chat.
 Activation ends exploration mode and is atomic. Every proposal and decision is
 versioned in the database.

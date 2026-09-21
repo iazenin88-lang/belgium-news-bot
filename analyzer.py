@@ -38,6 +38,7 @@ from editorial_feedback import (
 )
 from prefilter_learning import (
     PROPOSAL_SYSTEM_PROMPT,
+    PROPOSAL_TEXT_FORMAT,
     complete_policy_coverage,
     evaluate_policy,
     format_training_examples,
@@ -1535,17 +1536,29 @@ def maybe_create_prefilter_proposal(
                     "content": training_examples + retry_note,
                 },
             ],
+            text=PROPOSAL_TEXT_FORMAT,
         )
         attempt_input, attempt_output = extract_usage_tokens(response)
         input_tokens += attempt_input
         output_tokens += attempt_output
         cost = quantize_money(cost + calc_cost_usd(attempt_input, attempt_output))
-        policy = complete_policy_coverage(
-            rows,
-            remove_unsafe_negative_terms(
-                rows, parse_policy_proposal(pick_text(response))
-            ),
-        )
+        try:
+            policy = complete_policy_coverage(
+                rows,
+                remove_unsafe_negative_terms(
+                    rows, parse_policy_proposal(pick_text(response))
+                ),
+            )
+        except ValueError as error:
+            print(
+                f"Prefilter proposal attempt {attempt} returned invalid JSON: "
+                f"{error!r}"
+            )
+            retry_note = (
+                "\n\nПРЕДЫДУЩИЙ ОТВЕТ НЕ УДАЛОСЬ РАЗОБРАТЬ. "
+                "Верни только объект по заданной JSON-схеме."
+            )
+            continue
         metrics = evaluate_policy(rows, policy)
         if proposal_is_safe(metrics):
             break

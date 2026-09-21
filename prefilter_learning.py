@@ -8,6 +8,8 @@ from typing import Any, Iterable
 
 MIN_TRAINING_DECISIONS = 50
 MAX_TERMS = 30
+MAX_TRAINING_EXAMPLES = 200
+MAX_TRAINING_PROMPT_CHARS = 100_000
 
 PROPOSAL_SYSTEM_PROMPT = """
 Ты предлагаешь безопасное обновление предварительного фильтра новостей
@@ -18,6 +20,13 @@ PROPOSAL_SYSTEM_PROMPT = """
 которые встречаются в исходных заголовках/описаниях и помогают пропускать
 одобренные темы либо отсекать отклонённые. Не предлагай код, SQL или регулярные
 выражения. Не создавай широкий запрет из одного примера.
+
+Все отрицательные фразы должны дословно встречаться в исходном тексте хотя бы
+одной отклонённой новости и не должны встречаться ни в одной одобренной новости.
+Старайся покрыть отрицательными фразами не менее 20% отклонённых новостей,
+сохранив не менее 95% одобренных. В примерах могут быть разные языки — добавляй
+отдельные точные фразы для нужных языков. Не используй комментарий редактора как
+фразу фильтра: комментарий объясняет решение, но фильтр применяется к новости.
 
 Верни строго JSON:
 {
@@ -123,20 +132,71 @@ def proposal_is_safe(metrics: dict[str, Any]) -> bool:
     )
 
 
-def format_training_examples(rows: Iterable[dict[str, Any]], limit: int = 12000) -> str:
-    parts: list[str] = []
-    for row in rows:
+def format_training_examples(
+    rows: Iterable[dict[str, Any]],
+    limit: int = MAX_TRAINING_PROMPT_CHARS,
+) -> str:
+    """Format a balanced view of the whole labelled history.
+
+    Rows arrive newest-first.  The old implementation stopped after 12k
+    characters, so the model often saw only a handful of the latest decisions
+    while replay evaluated its proposal against the full history.  Interleaving
+    both labels prevents either class from disappearing when the size cap is
+    reached.
+    """
+    labelled = [
+        row
+        for row in rows
+        if row.get("feedback_type") in ("approved", "topic_mismatch")
+        and row.get("status") == "applied"
+    ]
+    approvals = [row for row in labelled if row.get("feedback_type") == "approved"]
+    declines = [
+        row for row in labelled if row.get("feedback_type") == "topic_mismatch"
+    ]
+
+    balanced: list[dict[str, Any]] = []
+    for index in range(max(len(approvals), len(declines))):
+        if index < len(approvals):
+            balanced.append(approvals[index])
+        if index < len(declines):
+            balanced.append(declines[index])
+        if len(balanced) >= MAX_TRAINING_EXAMPLES:
+            break
+
+    parts = [
+        f"ВСЕГО РЕШЕНИЙ: {len(labelled)}; "
+        f"ОПУБЛИКОВАНО: {len(approvals)}; "
+        f"НЕ ПОДХОДИТ ТЕМАТИКА: {len(declines)}"
+    ]
+    for row in balanced:
         kind = row.get("feedback_type")
-        if kind not in ("approved", "topic_mismatch") or row.get("status") != "applied":
-            continue
         label = "ОПУБЛИКОВАНО" if kind == "approved" else "НЕ ПОДХОДИТ ТЕМАТИКА"
         block = (
             f"{label}\n"
-            f"Заголовок: {str(row.get('source_title') or '')[:400]}\n"
-            f"Описание: {str(row.get('source_summary') or '')[:800]}\n"
-            f"Комментарий: {str(row.get('editor_comment') or '')[:500]}"
+            f"Заголовок: {str(row.get('source_title') or '')[:240]}\n"
+            f"Описание: {str(row.get('source_summary') or '')[:360]}\n"
+            f"Комментарий: {str(row.get('editor_comment') or '')[:240]}"
         )
-        if len("\n\n".join(parts + [block])) > limit:
+        candidate = "\n\n".join(parts + [block])
+        if len(candidate) > limit:
             break
         parts.append(block)
     return "\n\n".join(parts)
+
+
+def remove_unsafe_negative_terms(
+    rows: Iterable[dict[str, Any]], policy: dict[str, Any]
+) -> dict[str, Any]:
+    """Drop negative phrases that occur in any approved historical item."""
+    approved_texts = [
+        decision_text(row)
+        for row in rows
+        if row.get("feedback_type") == "approved" and row.get("status") == "applied"
+    ]
+    safe_negative = [
+        term
+        for term in policy.get("negative_terms", [])
+        if not any(term in text for text in approved_texts)
+    ]
+    return {**policy, "negative_terms": safe_negative}

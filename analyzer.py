@@ -43,6 +43,7 @@ from prefilter_learning import (
     parse_policy_proposal,
     policy_prefilter_decision,
     proposal_is_safe,
+    remove_unsafe_negative_terms,
 )
 from semantic_dedup import (
     EVENT_HISTORY_LIMIT,
@@ -1513,20 +1514,51 @@ def maybe_create_prefilter_proposal(
     if decisions - previous < minimum or approvals < 10 or declines < 10:
         return 0, 0, Decimal("0")
 
-    response = client.responses.create(
-        model=MODEL,
-        input=[
-            {"role": "system", "content": PROPOSAL_SYSTEM_PROMPT},
-            {"role": "user", "content": format_training_examples(rows)},
-        ],
-    )
-    input_tokens, output_tokens = extract_usage_tokens(response)
-    cost = calc_cost_usd(input_tokens, output_tokens)
-    policy = parse_policy_proposal(pick_text(response))
-    metrics = evaluate_policy(rows, policy)
-    if not proposal_is_safe(metrics):
-        print(f"Prefilter proposal rejected by replay: {metrics}")
+    training_examples = format_training_examples(rows)
+    input_tokens = output_tokens = 0
+    cost = Decimal("0")
+    policy: dict[str, Any] | None = None
+    metrics: dict[str, Any] | None = None
+    retry_note = ""
+
+    # One narrow proposal can fail the historical replay. Retry immediately
+    # with the measured failure instead of silently spending another API call
+    # on every scheduled analyzer run.
+    for attempt in range(1, 4):
+        response = client.responses.create(
+            model=MODEL,
+            input=[
+                {"role": "system", "content": PROPOSAL_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": training_examples + retry_note,
+                },
+            ],
+        )
+        attempt_input, attempt_output = extract_usage_tokens(response)
+        input_tokens += attempt_input
+        output_tokens += attempt_output
+        cost = quantize_money(cost + calc_cost_usd(attempt_input, attempt_output))
+        policy = remove_unsafe_negative_terms(
+            rows, parse_policy_proposal(pick_text(response))
+        )
+        metrics = evaluate_policy(rows, policy)
+        if proposal_is_safe(metrics):
+            break
+        print(
+            f"Prefilter proposal attempt {attempt} rejected by replay: {metrics}"
+        )
+        retry_note = (
+            "\n\nПРЕДЫДУЩАЯ ПОПЫТКА НЕ ПРОШЛА ПРОВЕРКУ НА ВСЕЙ ИСТОРИИ. "
+            f"Сохранение одобренных: {metrics['approval_retention']:.1%}; "
+            f"отсев тематических отклонений: {metrics['decline_rejection']:.1%}. "
+            "Предложи ДРУГИЕ дословные фразы. Обязательно сохрани не менее "
+            "95% одобренных и покрой не менее 20% отклонённых."
+        )
+    else:
         return input_tokens, output_tokens, cost
+
+    assert policy is not None and metrics is not None
 
     inserted = sb.table("prefilter_policy_proposals").insert({
         "summary": policy["summary"],

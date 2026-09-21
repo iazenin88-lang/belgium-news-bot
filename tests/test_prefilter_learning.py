@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import unittest
 
 from prefilter_learning import (
@@ -13,6 +14,15 @@ from prefilter_learning import (
 
 
 class PrefilterLearningTests(unittest.TestCase):
+    def test_proposal_insert_uses_current_supabase_query_builder(self):
+        analyzer = (Path(__file__).resolve().parents[1] / "analyzer.py").read_text()
+        proposal_block = analyzer[
+            analyzer.index('inserted_rows = sb.table("prefilter_policy_proposals")'):
+            analyzer.index('proposal_id = int(inserted["id"])')
+        ]
+        self.assertIn('.select("id").execute().data', proposal_block)
+        self.assertNotIn(".single()", proposal_block)
+
     def test_parser_accepts_only_bounded_term_lists(self):
         policy = parse_policy_proposal(json.dumps({
             "summary": "Narrow local sport",

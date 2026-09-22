@@ -13,6 +13,52 @@ MAX_TERMS = 30
 MAX_TRAINING_EXAMPLES = 200
 MAX_TRAINING_PROMPT_CHARS = 100_000
 
+BELGIAN_DOMESTIC_SOURCES = {
+    "brussels times",
+    "hln",
+    "vrt nws",
+}
+
+BELGIAN_AUTHORITY_TERMS = {
+    "administration communale",
+    "bourgmestre",
+    "brandweer",
+    "burgemeester",
+    "city council",
+    "commune",
+    "fire service",
+    "gemeente",
+    "inspectie",
+    "inspection",
+    "municipality",
+    "police",
+    "politie",
+    "pompiers",
+    "stadsbestuur",
+}
+
+BELGIAN_ENFORCEMENT_TERMS = {
+    "ban",
+    "brandveiligheid",
+    "closed",
+    "closure",
+    "fermé",
+    "fermée",
+    "fermeture",
+    "fire safety",
+    "interdiction",
+    "licence",
+    "license",
+    "permis",
+    "sanction",
+    "sanctie",
+    "gesloten",
+    "sluiting",
+    "uitbatingsvergunning",
+    "vergunning",
+    "verbod",
+}
+
 PROPOSAL_TEXT_FORMAT = {
     "format": {
         "type": "json_schema",
@@ -145,6 +191,32 @@ def policy_prefilter_decision(
     if negatives:
         return False, f"Learned negative signal: {negatives[0]}"
     return None, ""
+
+
+def _contains_whole_term(text: str, term: str) -> bool:
+    pattern = rf"(?<!\w){re.escape(term)}(?!\w)"
+    return bool(re.search(pattern, text, flags=re.IGNORECASE))
+
+
+def has_belgian_enforcement_signal(source_name: str, text: str) -> bool:
+    """Detect a concrete Belgian administrative or regulatory action.
+
+    The two-signal requirement deliberately excludes ordinary police and crime
+    reports.  It only sends an item to AI when a domestic Belgian source names
+    both a public authority and a concrete closure, permit, fire-safety, ban,
+    or sanction action.
+    """
+    source = " ".join((source_name or "").lower().split())
+    if source not in BELGIAN_DOMESTIC_SOURCES:
+        return False
+    lowered = (text or "").lower()
+    has_authority = any(
+        _contains_whole_term(lowered, term) for term in BELGIAN_AUTHORITY_TERMS
+    )
+    has_enforcement = any(
+        _contains_whole_term(lowered, term) for term in BELGIAN_ENFORCEMENT_TERMS
+    )
+    return has_authority and has_enforcement
 
 
 def evaluate_policy(

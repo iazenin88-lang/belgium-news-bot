@@ -37,6 +37,18 @@ from editorial_feedback import (
     parse_correction_response,
     validate_publication_length,
 )
+from editorial_memory import (
+    EMBEDDING_API_MODEL,
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_PROFILE,
+    MEMORY_MATCH_COUNT_PER_TYPE,
+    MEMORY_MIN_SIMILARITY,
+    article_embedding_text,
+    compact_neighbor_log,
+    embedding_text_hash,
+    format_semantic_memory,
+    score_semantic_neighbors,
+)
 from prefilter_learning import (
     PROPOSAL_SYSTEM_PROMPT,
     PROPOSAL_TEXT_FORMAT,
@@ -74,6 +86,7 @@ MODEL = "gpt-5-mini"
 # -------------------------------------------------------
 INPUT_COST_PER_1M = Decimal("0.250000")
 OUTPUT_COST_PER_1M = Decimal("2.000000")
+EMBEDDING_INPUT_COST_PER_1M = Decimal("0.020000")
 
 
 # -------------------------------------------------------
@@ -101,6 +114,9 @@ SYSTEM_PROMPT = """
 8. короткий пересказ на русском
 9. короткий заголовок для Telegram
 10. текст поста для Telegram
+
+Канал предназначен для жизни в Бельгии и для русско- и украиноязычных
+мигрантов, которые находятся в Бельгии.
 
 Считать релевантными в первую очередь:
 - миграция, визы, ВНЖ, убежище, украинские беженцы
@@ -130,6 +146,12 @@ SYSTEM_PROMPT = """
 
 Считать нерелевантными:
 - обычные мировые новости без практической связи с жизнью в Бельгии
+- новости из других стран НЕ становятся релевантными только потому, что они
+  «могут повлиять на ЕС, включая Бельгию». Нужны конкретное прямое последствие
+  для Бельгии либо конкретное влияние на права, обязанности или статус
+  российских/украинских мигрантов в Бельгии;
+- мнение, просьба, политическая позиция или предложение иностранного политика
+  без такого подтверждённого прямого влияния считать нерелевантными;
 - спорт, криминальные мелочи, если нет практической пользы
 - единичные мелкие преступления и полицейские случаи без административного
   решения, изменения правил или практической ценности
@@ -208,6 +230,9 @@ Content: {content}
 URL: {url}
 
 {editorial_policy_context}
+
+ПЕРСОНАЛЬНАЯ СЕМАНТИЧЕСКАЯ ПАМЯТЬ РЕДАКТОРА
+{semantic_memory_context}
 
 СВЕРКА С НЕДАВНИМ ПОКРЫТИЕМ СОБЫТИЙ
 {event_history_context}
@@ -726,6 +751,230 @@ def calc_cost_usd(input_tokens: int, output_tokens: int) -> Decimal:
     return quantize_money(input_cost + output_cost)
 
 
+def extract_embedding_usage_tokens(response: Any) -> int:
+    """Return billable input tokens from an Embeddings API response."""
+    usage = getattr(response, "usage", None)
+    if not usage:
+        return 0
+    return int(
+        getattr(usage, "prompt_tokens", 0)
+        or getattr(usage, "total_tokens", 0)
+        or 0
+    )
+
+
+def calc_embedding_cost_usd(input_tokens: int) -> Decimal:
+    cost = (
+        Decimal(input_tokens) / Decimal("1000000")
+    ) * EMBEDDING_INPUT_COST_PER_1M
+    return quantize_money(cost)
+
+
+def create_article_embeddings(
+    client: OpenAI,
+    texts: list[str],
+) -> tuple[list[list[float]], int, Decimal]:
+    """Create deterministic-profile embeddings for one API batch."""
+    if not texts:
+        return [], 0, Decimal("0")
+    response = client.embeddings.create(
+        model=EMBEDDING_API_MODEL,
+        input=texts,
+        dimensions=EMBEDDING_DIMENSIONS,
+        encoding_format="float",
+    )
+    ordered = sorted(response.data, key=lambda item: int(item.index))
+    vectors = [list(item.embedding) for item in ordered]
+    if len(vectors) != len(texts):
+        raise RuntimeError(
+            f"Embedding batch size mismatch: expected={len(texts)} "
+            f"received={len(vectors)}"
+        )
+    input_tokens = extract_embedding_usage_tokens(response)
+    return vectors, input_tokens, calc_embedding_cost_usd(input_tokens)
+
+
+def _stored_vector(value: Any) -> list[float] | None:
+    """Normalize a pgvector value returned by PostgREST for an RPC call."""
+    if isinstance(value, list):
+        return [float(item) for item in value]
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, list):
+            return [float(item) for item in parsed]
+    return None
+
+
+def _record_embedding_usage(
+    stats: dict[str, Any],
+    *,
+    calls: int,
+    input_tokens: int,
+    cost_usd: Decimal,
+    embedded: int,
+) -> None:
+    stats["ai_calls"] = int(stats.get("ai_calls", 0)) + calls
+    stats["input_tokens"] = int(stats.get("input_tokens", 0)) + input_tokens
+    stats["cost_usd"] = quantize_money(
+        Decimal(stats.get("cost_usd", Decimal("0"))) + cost_usd
+    )
+    stats["embedded"] = int(stats.get("embedded", 0)) + embedded
+
+
+def _save_article_embedding(
+    sb,
+    article_id: int,
+    vector: list[float],
+    text_hash: str,
+) -> None:
+    sb.table("articles").update({
+        "relevance_embedding": vector,
+        "relevance_embedding_model": EMBEDDING_PROFILE,
+        "relevance_embedding_hash": text_hash,
+        "relevance_embedding_updated_at": now_iso(),
+    }).eq("id", article_id).execute()
+
+
+def ensure_article_embedding(
+    sb,
+    client: OpenAI,
+    article_id: int,
+    article: dict[str, Any],
+    stats: dict[str, Any],
+) -> list[float]:
+    """Return a current article embedding, persisting it when necessary."""
+    text = article_embedding_text(article)
+    text_hash = embedding_text_hash(text)
+    stored = _stored_vector(article.get("relevance_embedding"))
+    if (
+        stored is not None
+        and article.get("relevance_embedding_model") == EMBEDDING_PROFILE
+        and article.get("relevance_embedding_hash") == text_hash
+    ):
+        return stored
+
+    vectors, input_tokens, cost_usd = create_article_embeddings(client, [text])
+    vector = vectors[0]
+    _save_article_embedding(sb, article_id, vector, text_hash)
+    _record_embedding_usage(
+        stats,
+        calls=1,
+        input_tokens=input_tokens,
+        cost_usd=cost_usd,
+        embedded=1,
+    )
+    return vector
+
+
+def backfill_editorial_memory(
+    sb,
+    client: OpenAI,
+    stats: dict[str, Any],
+    *,
+    batch_size: int = 32,
+) -> int:
+    """Embed every applied approval/topic rejection missing this profile."""
+    feedback_rows = (
+        sb.table("editorial_feedback")
+        .select("article_id")
+        .eq("status", "applied")
+        .in_("feedback_type", ["approved", "topic_mismatch"])
+        .execute()
+    ).data or []
+    article_ids = sorted({
+        int(row["article_id"])
+        for row in feedback_rows
+        if row.get("article_id") is not None
+    })
+    if not article_ids:
+        return 0
+
+    pending: list[tuple[int, str, str]] = []
+    for offset in range(0, len(article_ids), 100):
+        article_rows = (
+            sb.table("articles")
+            .select(
+                "id,title,summary,content,relevance_embedding,"
+                "relevance_embedding_model,relevance_embedding_hash"
+            )
+            .in_("id", article_ids[offset:offset + 100])
+            .execute()
+        ).data or []
+        for article in article_rows:
+            text = article_embedding_text(article)
+            text_hash = embedding_text_hash(text)
+            current = _stored_vector(article.get("relevance_embedding"))
+            if (
+                current is None
+                or article.get("relevance_embedding_model") != EMBEDDING_PROFILE
+                or article.get("relevance_embedding_hash") != text_hash
+            ):
+                pending.append((int(article["id"]), text, text_hash))
+
+    for offset in range(0, len(pending), batch_size):
+        batch = pending[offset:offset + batch_size]
+        vectors, input_tokens, cost_usd = create_article_embeddings(
+            client,
+            [item[1] for item in batch],
+        )
+        for (article_id, _text, text_hash), vector in zip(batch, vectors):
+            _save_article_embedding(sb, article_id, vector, text_hash)
+        _record_embedding_usage(
+            stats,
+            calls=1,
+            input_tokens=input_tokens,
+            cost_usd=cost_usd,
+            embedded=len(batch),
+        )
+        print(
+            "Semantic memory backfill: "
+            f"embedded={min(offset + len(batch), len(pending))}/{len(pending)}"
+        )
+    return len(pending)
+
+
+def load_semantic_memory_context(
+    sb,
+    client: OpenAI,
+    article_id: int,
+    article: dict[str, Any],
+    stats: dict[str, Any],
+) -> str:
+    """Retrieve full-history decisions and persist a shadow prediction."""
+    vector = ensure_article_embedding(sb, client, article_id, article, stats)
+    rows = sb.rpc("match_editorial_decisions", {
+        "p_query_embedding": vector,
+        "p_embedding_model": EMBEDDING_PROFILE,
+        "p_match_count_per_type": MEMORY_MATCH_COUNT_PER_TYPE,
+        "p_min_similarity": MEMORY_MIN_SIMILARITY,
+        "p_exclude_article_id": article_id,
+    }).execute().data or []
+    score = score_semantic_neighbors(rows)
+    sb.table("editorial_memory_predictions").upsert({
+        "article_id": article_id,
+        "embedding_model": EMBEDDING_PROFILE,
+        "mode": "shadow",
+        "predicted_feedback_type": score["prediction"],
+        "confidence": score["confidence"],
+        "approval_score": score["approval_score"],
+        "rejection_score": score["rejection_score"],
+        "approval_examples": score["approval_examples"],
+        "rejection_examples": score["rejection_examples"],
+        "neighbors": compact_neighbor_log(rows),
+        "updated_at": now_iso(),
+    }, on_conflict="article_id").execute()
+    print(
+        f"Semantic memory article_id={article_id}: "
+        f"prediction={score['prediction']} confidence={score['confidence']:.3f} "
+        f"approved_examples={score['approval_examples']} "
+        f"rejected_examples={score['rejection_examples']}"
+    )
+    return format_semantic_memory(rows)
+
+
 # -------------------------------------------------------
 # Вызов OpenAI
 # -------------------------------------------------------
@@ -733,6 +982,7 @@ def analyze_article(
     client: OpenAI,
     article: dict[str, Any],
     editorial_policy_context: str = "",
+    semantic_memory_context: str = "",
     event_history: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], int, int, Decimal]:
     """
@@ -755,6 +1005,7 @@ def analyze_article(
         content=content,
         url=url,
         editorial_policy_context=editorial_policy_context,
+        semantic_memory_context=semantic_memory_context,
         event_history_context=format_event_history(event_history),
     )
 
@@ -1702,6 +1953,23 @@ def main():
     )
     correction_stats = process_pending_corrections(sb, oa)
 
+    embedding_stats: dict[str, Any] = {
+        "ai_calls": 0,
+        "input_tokens": 0,
+        "cost_usd": Decimal("0"),
+        "embedded": 0,
+    }
+    try:
+        backfilled = backfill_editorial_memory(sb, oa, embedding_stats)
+        print(
+            "Semantic editorial memory ready: "
+            f"newly_embedded={backfilled} profile={EMBEDDING_PROFILE}"
+        )
+    except Exception as error:
+        # Memory is initially advisory. A temporary embedding/RPC failure must
+        # not stop the existing article pipeline or silently reject anything.
+        print(f"WARNING: semantic memory backfill unavailable: {repr(error)}")
+
     result = (
         sb.table("articles")
         .select("*")
@@ -1799,6 +2067,9 @@ def main():
             "canonical_url": row.get("canonical_url"),
             "original_url": row.get("original_url"),
             "published_at": row.get("published_at"),
+            "relevance_embedding": row.get("relevance_embedding"),
+            "relevance_embedding_model": row.get("relevance_embedding_model"),
+            "relevance_embedding_hash": row.get("relevance_embedding_hash"),
         }
 
         try:
@@ -1816,10 +2087,31 @@ def main():
 
             print(f"Sending article_id={article_id} to AI: {prefilter_reason}")
 
+            try:
+                semantic_memory_context = load_semantic_memory_context(
+                    sb,
+                    oa,
+                    article_id,
+                    article,
+                    embedding_stats,
+                )
+            except Exception as error:
+                # Shadow-mode memory is fail-open: the established AI filter
+                # still decides and no candidate is lost because memory failed.
+                semantic_memory_context = (
+                    "Семантическая память временно недоступна; оцени статью "
+                    "строго по редакционной политике."
+                )
+                print(
+                    f"WARNING: semantic memory unavailable for "
+                    f"article_id={article_id}: {repr(error)}"
+                )
+
             analysis, input_tokens, output_tokens, cost_usd = analyze_article(
                 oa,
                 article,
                 editorial_policy_context,
+                semantic_memory_context,
                 event_history,
             )
 
@@ -1948,6 +2240,19 @@ def main():
                 total_cost_usd = quantize_money(total_cost_usd + proposal_cost)
         except Exception as e:
             print(f"WARNING: prefilter proposal failed safely: {repr(e)}")
+
+    ai_calls += int(embedding_stats["ai_calls"])
+    total_input_tokens += int(embedding_stats["input_tokens"])
+    total_cost_usd = quantize_money(
+        total_cost_usd + Decimal(embedding_stats["cost_usd"])
+    )
+    print(
+        "Semantic memory usage: "
+        f"embeddings={embedding_stats['embedded']} "
+        f"calls={embedding_stats['ai_calls']} "
+        f"input_tokens={embedding_stats['input_tokens']} "
+        f"cost_usd={embedding_stats['cost_usd']}"
+    )
 
     starting_balance, spent_total_usd, remaining_estimated_usd = finish_ai_run(
         sb=sb,

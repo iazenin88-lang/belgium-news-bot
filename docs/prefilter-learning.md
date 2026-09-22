@@ -29,3 +29,15 @@ the editor still sees replay metrics and must activate the policy.
 The editor can inspect, activate, or reject the proposal in the editor chat.
 Activation ends exploration mode and is atomic. Every proposal and decision is
 versioned in the database.
+
+## Location-neutral Belgian coverage
+
+No Belgian city, commune, district, province, or region is a relevance signal.
+Every non-empty article from a Belgian domestic source reaches the main AI
+unless it matches an explicit hard exclusion. The AI then separates routine
+local details from genuinely outstanding Belgian events.
+
+Learned positive keyword shortcuts are disabled because they previously
+overfit to a few place names. Positive learning now comes from semantic memory
+and the main AI evaluation. Human-approved negative phrases remain conservative
+prefilter exclusions.

@@ -7,8 +7,8 @@ from editorial_memory import (
     embedding_text_hash,
     format_semantic_memory,
     score_semantic_neighbors,
+    semantic_rescue_recommended,
 )
-
 
 class EditorialMemoryTests(unittest.TestCase):
     def test_main_scores_shadow_memory_before_prefilter(self):
@@ -16,7 +16,7 @@ class EditorialMemoryTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "analyzer.py"
         ).read_text(encoding="utf-8")
         semantic_call = source.index(
-            "semantic_memory_context = load_semantic_memory_context"
+            "semantic_memory_context, semantic_score = load_semantic_memory_context"
         )
         prefilter_call = source.index(
             "send_to_ai, prefilter_reason = should_send_to_ai"
@@ -48,6 +48,33 @@ class EditorialMemoryTests(unittest.TestCase):
         score = score_semantic_neighbors(rows)
         self.assertEqual(score["prediction"], "topic_mismatch")
         self.assertGreater(score["rejection_score"], score["approval_score"])
+
+    def test_approval_prediction_can_only_rescue_for_ai_review(self):
+        self.assertTrue(semantic_rescue_recommended({
+            "prediction": "approved",
+            "confidence": 0.08,
+            "approval_examples": 3,
+        }))
+        self.assertFalse(semantic_rescue_recommended({
+            "prediction": "topic_mismatch",
+            "confidence": 0.40,
+            "approval_examples": 3,
+        }))
+
+    def test_domestic_source_gate_precedes_keyword_heuristics(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "analyzer.py"
+        ).read_text(encoding="utf-8")
+        domestic_gate = source.index("if is_belgian_domestic_source(source_name)")
+        keyword_heuristics = source.index("pass_matches = count_matches")
+        self.assertLess(domestic_gate, keyword_heuristics)
+
+    def test_location_neutrality_is_explicit_in_relevance_prompt(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "analyzer.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("ГЕОГРАФИЧЕСКАЯ НЕЙТРАЛЬНОСТЬ", source)
+        self.assertIn("editorial_interest_score", source)
 
     def test_close_scores_remain_uncertain(self):
         rows = [

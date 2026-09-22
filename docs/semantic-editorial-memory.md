@@ -25,7 +25,14 @@ history. These examples are added to the relevance prompt.
 
 The system also writes a balanced nearest-neighbour prediction to
 `editorial_memory_predictions`. `mode = 'shadow'` is an invariant: the semantic
-score is observable but cannot itself reject or publish an article.
+score cannot itself reject or publish an article. A likely approval may only
+rescue a borderline article into the main AI evaluation; the main relevance
+model and editor workflow still make the actual decision.
+
+Semantic scoring runs before deterministic prefiltering so false negatives are
+observable. All non-empty, non-hard-rejected items from Belgian domestic news
+sources reach the main AI regardless of the city, commune, district, province,
+or region named in the story.
 
 Retrieval uses exact cosine distance while the labelled dataset is small. This
 avoids approximate-index recall loss during safety evaluation.

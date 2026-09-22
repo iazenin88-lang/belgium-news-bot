@@ -17,6 +17,7 @@ EMBEDDING_PROFILE = "text-embedding-3-small:512:editorial-v1"
 MEMORY_MATCH_COUNT_PER_TYPE = 5
 MEMORY_MIN_SIMILARITY = 0.30
 MEMORY_CONTEXT_MAX_CHARS = 8_000
+SEMANTIC_RESCUE_MIN_CONFIDENCE = 0.02
 
 
 def _clean(value: Any, limit: int) -> str:
@@ -85,6 +86,26 @@ def score_semantic_neighbors(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         "approval_examples": len(grouped["approved"]),
         "rejection_examples": len(grouped["topic_mismatch"]),
     }
+
+
+def semantic_rescue_recommended(score: dict[str, Any] | None) -> bool:
+    """Let a likely approval reach AI without directly accepting the story.
+
+    This is deliberately one-way: semantic memory may rescue a borderline
+    article from a deterministic prefilter, but it can never reject or publish
+    an article by itself.
+    """
+    if not score or score.get("prediction") != "approved":
+        return False
+    try:
+        confidence = float(score.get("confidence") or 0.0)
+        approval_examples = int(score.get("approval_examples") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        approval_examples > 0
+        and confidence >= SEMANTIC_RESCUE_MIN_CONFIDENCE
+    )
 
 
 def format_semantic_memory(

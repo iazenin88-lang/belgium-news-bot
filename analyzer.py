@@ -33,6 +33,7 @@ from editorial_feedback import (
     CORRECTION_SYSTEM_PROMPT,
     build_correction_prompt,
     build_editorial_policy_context,
+    enforce_ordinary_person_relevance_guard,
     parse_correction_response,
     validate_publication_length,
 )
@@ -92,10 +93,13 @@ SYSTEM_PROMPT = """
 2. категория новости
 3. общественная важность по шкале 1-10
 4. практическая польза по шкале 1-10
-5. краткая причина
-6. короткий пересказ на русском
-7. короткий заголовок для Telegram
-8. текст поста для Telegram
+5. является ли материал личным происшествием со спортсменом, знаменитостью
+   или другой публичной персоной
+6. прошёл бы тот же сюжет тест неизвестного обычного человека
+7. краткая причина
+8. короткий пересказ на русском
+9. короткий заголовок для Telegram
+10. текст поста для Telegram
 
 Считать релевантными в первую очередь:
 - миграция, визы, ВНЖ, убежище, украинские беженцы
@@ -126,6 +130,27 @@ SYSTEM_PROMPT = """
 - развлекательные новости низкой значимости без общественного или практического смысла
 - реклама одного бренда без сравнения, ясных условий или заметной выгоды
 - скидки на отдельные необязательные товары и партнёрские рекламные подборки
+
+ОБЯЗАТЕЛЬНЫЙ ТЕСТ НЕИЗВЕСТНОГО ЧЕЛОВЕКА:
+- Если материал описывает личное происшествие, травму, болезнь, смерть,
+  бытовое преступление или частную жизнь спортсмена, знаменитости, члена
+  королевской семьи либо другой публичной персоны, мысленно замени этого
+  человека неизвестным частным лицом.
+- Если после такой замены канал не стал бы публиковать событие, укажи
+  is_public_figure_personal_incident=true,
+  passes_ordinary_person_test=false и is_relevant=false независимо от
+  категории safety и выставленных баллов.
+- Известность человека, спортивные результаты, влияние происшествия на матч,
+  медали или карьеру, а также комментарий спортивной федерации сами по себе
+  НЕ являются общественной или практической пользой для жителей Бельгии.
+- Тест можно считать пройденным только при самостоятельном широком последствии:
+  изменении закона или правил, подтверждённой системной проблеме, массовом
+  происшествии, крупном нарушении транспорта/услуг либо практическом
+  предупреждении для читателей. Не объявляй единичный случай системной
+  проблемой на основании предположения.
+- Для материалов, которые не являются личным происшествием с публичной
+  персоной, указывай is_public_figure_personal_incident=false и
+  passes_ordinary_person_test=true.
 
 Оценивай два разных свойства новости:
 - importance_score — общественная значимость, масштаб последствий и число затронутых людей
@@ -189,6 +214,8 @@ URL: {url}
   "category": "migration",
   "importance_score": 8,
   "practical_value_score": 7,
+  "is_public_figure_personal_incident": false,
+  "passes_ordinary_person_test": true,
   "reason": "Коротко почему новость важна",
   "russian_summary": "Короткий пересказ на русском, 2-4 предложения.",
   "telegram_title": "Короткий заголовок",
@@ -736,17 +763,19 @@ def analyze_article(
     input_tokens, output_tokens = extract_usage_tokens(response)
     cost_usd = calc_cost_usd(input_tokens, output_tokens)
 
+    is_relevant, relevance_reason = enforce_ordinary_person_relevance_guard(data)
+
     public_importance_score = normalize_int(data.get("importance_score", 1))
     practical_value_score = normalize_int(data.get("practical_value_score", 1))
     editorial_score = max(public_importance_score, practical_value_score)
 
     analysis = {
-        "is_relevant": bool(data.get("is_relevant", False)),
+        "is_relevant": is_relevant,
         "category": normalize_text(data.get("category", "other"), 100),
         "importance_score": editorial_score,
         "public_importance_score": public_importance_score,
         "practical_value_score": practical_value_score,
-        "reason": normalize_text(data.get("reason", ""), 1000),
+        "reason": relevance_reason,
         "russian_summary": normalize_text(data.get("russian_summary", ""), 4000),
         "telegram_title": normalize_text(data.get("telegram_title", ""), 300),
         "telegram_text": normalize_text(data.get("telegram_text", ""), 4000),

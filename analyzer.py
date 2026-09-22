@@ -2073,6 +2073,30 @@ def main():
         }
 
         try:
+            # Score every unseen article before prefiltering. The prediction is
+            # still shadow-only, but this ordering lets us audit whether the
+            # prefilter would have silently hidden articles resembling past
+            # approvals—the key false-negative risk before automation.
+            try:
+                semantic_memory_context = load_semantic_memory_context(
+                    sb,
+                    oa,
+                    article_id,
+                    article,
+                    embedding_stats,
+                )
+            except Exception as error:
+                # Shadow-mode memory is fail-open: the established filters
+                # still decide and no candidate is lost because memory failed.
+                semantic_memory_context = (
+                    "Семантическая память временно недоступна; оцени статью "
+                    "строго по редакционной политике."
+                )
+                print(
+                    f"WARNING: semantic memory unavailable for "
+                    f"article_id={article_id}: {repr(error)}"
+                )
+
             send_to_ai, prefilter_reason = should_send_to_ai(
                 article,
                 learning_mode=learning_mode,
@@ -2086,26 +2110,6 @@ def main():
                 continue
 
             print(f"Sending article_id={article_id} to AI: {prefilter_reason}")
-
-            try:
-                semantic_memory_context = load_semantic_memory_context(
-                    sb,
-                    oa,
-                    article_id,
-                    article,
-                    embedding_stats,
-                )
-            except Exception as error:
-                # Shadow-mode memory is fail-open: the established AI filter
-                # still decides and no candidate is lost because memory failed.
-                semantic_memory_context = (
-                    "Семантическая память временно недоступна; оцени статью "
-                    "строго по редакционной политике."
-                )
-                print(
-                    f"WARNING: semantic memory unavailable for "
-                    f"article_id={article_id}: {repr(error)}"
-                )
 
             analysis, input_tokens, output_tokens, cost_usd = analyze_article(
                 oa,

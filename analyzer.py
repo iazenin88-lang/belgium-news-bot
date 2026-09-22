@@ -43,6 +43,7 @@ from prefilter_learning import (
     complete_policy_coverage,
     evaluate_policy,
     format_training_examples,
+    has_belgian_enforcement_signal,
     parse_policy_proposal,
     policy_prefilter_decision,
     proposal_is_safe,
@@ -116,6 +117,10 @@ SYSTEM_PROMPT = """
   электричество, газ, страхование и банковские услуги
 - права потребителей, изменения цен, тарифов и условий договоров
 - изменения законов и правил в Бельгии и ЕС, влияющие на жизнь в Бельгии
+- решения бельгийских муниципалитетов, мэров, полиции, пожарной инспекции
+  или регуляторов о закрытии заведений, приостановке или отзыве разрешений
+  и других административных мерах, если материал конкретно показывает,
+  как в Бельгии применяются законы или правила
 - важные новости о Брюсселе, Фландрии, Валлонии
 - новости соседних стран, если они реально влияют на жизнь людей в Бельгии
 - новости про Россию, россиян, русских, если они могут быть значимы
@@ -126,6 +131,8 @@ SYSTEM_PROMPT = """
 Считать нерелевантными:
 - обычные мировые новости без практической связи с жизнью в Бельгии
 - спорт, криминальные мелочи, если нет практической пользы
+- единичные мелкие преступления и полицейские случаи без административного
+  решения, изменения правил или практической ценности
 - локальные мелочи без заметного влияния на читателей
 - развлекательные новости низкой значимости без общественного или практического смысла
 - реклама одного бренда без сравнения, ясных условий или заметной выгоды
@@ -569,6 +576,7 @@ def should_send_to_ai(
 
     combined = f"{title}\n{summary}\n{content}".strip()
     combined_lower = combined.lower()
+    source_name = normalize_text(article.get("source_name"), 200)
 
     if not title and not summary and not content:
         return False, "Нет заголовка, summary и content"
@@ -576,7 +584,16 @@ def should_send_to_ai(
     learned_decision, learned_reason = policy_prefilter_decision(
         combined_lower, learned_policy
     )
-    if learned_decision is not None:
+    if learned_decision is True:
+        return learned_decision, learned_reason
+
+    if (
+        has_belgian_enforcement_signal(source_name, combined_lower)
+        and (len(summary) >= 80 or len(content) >= 250)
+    ):
+        return True, "Бельгийское применение закона или административная мера"
+
+    if learned_decision is False:
         return learned_decision, learned_reason
 
     if contains_any(combined_lower, HARD_REJECT_KEYWORDS):

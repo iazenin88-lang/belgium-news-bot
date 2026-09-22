@@ -72,6 +72,28 @@ def _clean(value: Any, limit: int) -> str:
     return " ".join(str(value).split())[:limit]
 
 
+def enforce_ordinary_person_relevance_guard(
+    data: dict[str, Any],
+) -> tuple[bool, str]:
+    """Reject personal public-figure stories that matter only because of fame."""
+    incident = data.get("is_public_figure_personal_incident")
+    passed = data.get("passes_ordinary_person_test")
+    if not isinstance(incident, bool) or not isinstance(passed, bool):
+        raise ValueError(
+            "AI response is missing the mandatory ordinary-person relevance test"
+        )
+
+    reason = _clean(data.get("reason"), 1000)
+    if incident and not passed:
+        return (
+            False,
+            "Личное происшествие с публичной персоной не прошло тест "
+            "неизвестного человека и не имеет самостоятельных широких "
+            "последствий для аудитории канала.",
+        )
+    return bool(data.get("is_relevant", False)), reason
+
+
 def _format_example(row: dict[str, Any], label: str, include_reason: bool) -> str:
     source_title = _clean(row.get("source_title"), 260)
     draft_title = _clean(row.get("draft_title"), 260)

@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from editorial_memory import (
     EMBEDDING_PROFILE,
@@ -10,6 +11,18 @@ from editorial_memory import (
 
 
 class EditorialMemoryTests(unittest.TestCase):
+    def test_main_scores_shadow_memory_before_prefilter(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "analyzer.py"
+        ).read_text(encoding="utf-8")
+        semantic_call = source.index(
+            "semantic_memory_context = load_semantic_memory_context"
+        )
+        prefilter_call = source.index(
+            "send_to_ai, prefilter_reason = should_send_to_ai"
+        )
+        self.assertLess(semantic_call, prefilter_call)
+
     def test_embedding_text_is_stable_and_uses_source_content(self):
         article = {
             "title": "  Macron asks EU  ",

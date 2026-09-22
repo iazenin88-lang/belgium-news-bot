@@ -9,6 +9,7 @@ from prefilter_learning import (
     policy_prefilter_decision,
     proposal_is_safe,
     format_training_examples,
+    has_belgian_enforcement_signal,
     remove_unsafe_negative_terms,
 )
 
@@ -53,6 +54,25 @@ class PrefilterLearningTests(unittest.TestCase):
             },
         )
         self.assertTrue(decision)
+
+    def test_belgian_closure_and_fire_safety_goes_to_ai(self):
+        text = (
+            "Café Las Vegas in Berchem voor de derde keer gesloten. "
+            "De politie stelde opnieuw drugs vast en er waren problemen "
+            "met de brandveiligheid en de uitbatingsvergunning."
+        )
+        self.assertTrue(has_belgian_enforcement_signal("VRT NWS", text))
+
+    def test_ordinary_local_police_story_stays_out(self):
+        text = (
+            "De politie onderzoekt een verkeersongeval waarbij een jonge "
+            "wielrenner tijdens een training gewond raakte."
+        )
+        self.assertFalse(has_belgian_enforcement_signal("VRT NWS", text))
+
+    def test_non_domestic_source_does_not_get_domestic_exception(self):
+        text = "Police closed a venue after repeated fire safety violations."
+        self.assertFalse(has_belgian_enforcement_signal("Politico EU", text))
 
     def test_text_corrections_do_not_affect_relevance_metrics(self):
         rows = [

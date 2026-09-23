@@ -88,6 +88,7 @@ MODEL = "gpt-5-mini"
 # Значения ниже задаются в долларах за 1 миллион токенов.
 # -------------------------------------------------------
 INPUT_COST_PER_1M = Decimal("0.250000")
+CACHED_INPUT_COST_PER_1M = Decimal("0.025000")
 OUTPUT_COST_PER_1M = Decimal("2.000000")
 EMBEDDING_INPUT_COST_PER_1M = Decimal("0.020000")
 
@@ -761,28 +762,45 @@ def should_send_to_ai(
 # -------------------------------------------------------
 # Считаем стоимость OpenAI-вызова
 # -------------------------------------------------------
-def extract_usage_tokens(response: Any) -> tuple[int, int]:
+def extract_usage_tokens(response: Any) -> tuple[int, int, int]:
     """
     Пытается достать input/output tokens из ответа OpenAI.
     """
     input_tokens = 0
+    cached_input_tokens = 0
     output_tokens = 0
 
     usage = getattr(response, "usage", None)
     if usage:
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+        input_details = getattr(usage, "input_tokens_details", None)
+        if input_details:
+            cached_input_tokens = int(
+                getattr(input_details, "cached_tokens", 0) or 0
+            )
         output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
 
-    return input_tokens, output_tokens
+    return input_tokens, cached_input_tokens, output_tokens
 
 
-def calc_cost_usd(input_tokens: int, output_tokens: int) -> Decimal:
+def calc_cost_usd(
+    input_tokens: int,
+    output_tokens: int,
+    cached_input_tokens: int = 0,
+) -> Decimal:
     """
     Считает стоимость запроса в долларах.
     """
-    input_cost = (Decimal(input_tokens) / Decimal("1000000")) * INPUT_COST_PER_1M
+    cached_input_tokens = min(max(cached_input_tokens, 0), input_tokens)
+    uncached_input_tokens = input_tokens - cached_input_tokens
+    input_cost = (
+        Decimal(uncached_input_tokens) / Decimal("1000000")
+    ) * INPUT_COST_PER_1M
+    cached_input_cost = (
+        Decimal(cached_input_tokens) / Decimal("1000000")
+    ) * CACHED_INPUT_COST_PER_1M
     output_cost = (Decimal(output_tokens) / Decimal("1000000")) * OUTPUT_COST_PER_1M
-    return quantize_money(input_cost + output_cost)
+    return quantize_money(input_cost + cached_input_cost + output_cost)
 
 
 def extract_embedding_usage_tokens(response: Any) -> int:
@@ -1062,8 +1080,12 @@ def analyze_article(
 
     data = json.loads(raw)
 
-    input_tokens, output_tokens = extract_usage_tokens(response)
-    cost_usd = calc_cost_usd(input_tokens, output_tokens)
+    input_tokens, cached_input_tokens, output_tokens = extract_usage_tokens(response)
+    cost_usd = calc_cost_usd(
+        input_tokens,
+        output_tokens,
+        cached_input_tokens,
+    )
 
     is_relevant, relevance_reason = enforce_ordinary_person_relevance_guard(data)
 
@@ -1139,6 +1161,7 @@ def review_telegram_text(
 
     total_input_tokens = 0
     total_output_tokens = 0
+    total_cost_usd = Decimal("0")
     calls = 0
     last_error = ""
 
@@ -1159,9 +1182,13 @@ def review_telegram_text(
         )
 
         calls += 1
-        input_tokens, output_tokens = extract_usage_tokens(response)
+        input_tokens, cached_input_tokens, output_tokens = extract_usage_tokens(response)
         total_input_tokens += input_tokens
         total_output_tokens += output_tokens
+        total_cost_usd = quantize_money(
+            total_cost_usd
+            + calc_cost_usd(input_tokens, output_tokens, cached_input_tokens)
+        )
 
         try:
             raw = pick_text(response)
@@ -1196,7 +1223,6 @@ def review_telegram_text(
                 "telegram_text": telegram_text,
             })
 
-            total_cost_usd = calc_cost_usd(total_input_tokens, total_output_tokens)
             print(f"Editorial review completed in {attempt} attempt(s)")
             return (
                 reviewed_analysis,
@@ -1211,7 +1237,6 @@ def review_telegram_text(
             last_error = repr(e)
             print(f"WARNING: editorial review attempt {attempt} failed: {last_error}")
 
-    total_cost_usd = calc_cost_usd(total_input_tokens, total_output_tokens)
     return (
         None,
         total_input_tokens,
@@ -1391,6 +1416,7 @@ def revise_telegram_text_from_feedback(
     user_prompt = build_correction_prompt(article, analysis, editor_comment)
     total_input_tokens = 0
     total_output_tokens = 0
+    total_cost_usd = Decimal("0")
     calls = 0
     last_error = ""
 
@@ -1410,9 +1436,13 @@ def revise_telegram_text_from_feedback(
             ],
         )
         calls += 1
-        input_tokens, output_tokens = extract_usage_tokens(response)
+        input_tokens, cached_input_tokens, output_tokens = extract_usage_tokens(response)
         total_input_tokens += input_tokens
         total_output_tokens += output_tokens
+        total_cost_usd = quantize_money(
+            total_cost_usd
+            + calc_cost_usd(input_tokens, output_tokens, cached_input_tokens)
+        )
 
         try:
             title, text = parse_correction_response(pick_text(response))
@@ -1425,7 +1455,7 @@ def revise_telegram_text_from_feedback(
                 revised_analysis,
                 total_input_tokens,
                 total_output_tokens,
-                calc_cost_usd(total_input_tokens, total_output_tokens),
+                total_cost_usd,
                 calls,
                 "",
             )
@@ -1439,7 +1469,7 @@ def revise_telegram_text_from_feedback(
         None,
         total_input_tokens,
         total_output_tokens,
-        calc_cost_usd(total_input_tokens, total_output_tokens),
+        total_cost_usd,
         calls,
         last_error or "Unknown feedback correction error",
     )
@@ -1767,6 +1797,7 @@ def send_run_balance_message(
     bot_token: str,
     chat_id: str,
     run_cost_usd: Decimal,
+    starting_balance_usd: Decimal,
     spent_total_usd: Decimal,
     remaining_estimated_usd: Decimal,
     collected: int,
@@ -1786,6 +1817,7 @@ def send_run_balance_message(
         ai_rejected=ai_rejected,
         passed_to_editor=passed_to_editor,
         run_cost_usd=run_cost_usd,
+        starting_balance_usd=starting_balance_usd,
         spent_total_usd=spent_total_usd,
         remaining_estimated_usd=remaining_estimated_usd,
         errors=errors,
@@ -1882,10 +1914,19 @@ def maybe_create_prefilter_proposal(
             ],
             text=PROPOSAL_TEXT_FORMAT,
         )
-        attempt_input, attempt_output = extract_usage_tokens(response)
+        attempt_input, attempt_cached_input, attempt_output = (
+            extract_usage_tokens(response)
+        )
         input_tokens += attempt_input
         output_tokens += attempt_output
-        cost = quantize_money(cost + calc_cost_usd(attempt_input, attempt_output))
+        cost = quantize_money(
+            cost
+            + calc_cost_usd(
+                attempt_input,
+                attempt_output,
+                attempt_cached_input,
+            )
+        )
         try:
             policy = complete_policy_coverage(
                 rows,
@@ -2424,6 +2465,7 @@ def main():
                 bot_token=bot_token,
                 chat_id=chat_id,
                 run_cost_usd=total_cost_usd,
+                starting_balance_usd=starting_balance,
                 spent_total_usd=spent_total_usd,
                 remaining_estimated_usd=remaining_estimated_usd,
                 collected=(

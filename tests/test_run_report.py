@@ -11,7 +11,8 @@ class RunReportTests(unittest.TestCase):
             ai_rejected=17,
             passed_to_editor=1,
             run_cost_usd="0.053856",
-            spent_total_usd="12.778692",
+            starting_balance_usd="9.950000",
+            spent_total_usd="7.728489",
             remaining_estimated_usd="2.274331",
         )
 
@@ -19,6 +20,8 @@ class RunReportTests(unittest.TestCase):
         self.assertIn("Отсеяно префильтром: 2", report)
         self.assertIn("Отсеяно AI: 17", report)
         self.assertIn("Передано в редакторский чат: 1", report)
+        self.assertIn("Бюджет после пополнения: $9.950000", report)
+        self.assertIn("Расход после пополнения: $7.728489", report)
         self.assertNotIn("AI calls", report)
 
     def test_only_shows_optional_operational_details_when_present(self):
@@ -31,6 +34,7 @@ class RunReportTests(unittest.TestCase):
             corrections_processed=2,
             corrections_failed=1,
             run_cost_usd="0.01",
+            starting_balance_usd="9.95",
             spent_total_usd="1.01",
             remaining_estimated_usd="8.99",
         )

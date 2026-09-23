@@ -118,6 +118,17 @@ PROPOSAL_SYSTEM_PROMPT = """
 отдельные точные фразы для нужных языков. Не используй комментарий редактора как
 фразу фильтра: комментарий объясняет решение, но фильтр применяется к новости.
 
+ГЕОГРАФИЧЕСКАЯ НЕЙТРАЛЬНОСТЬ — ОБЯЗАТЕЛЬНОЕ ПРАВИЛО:
+- канал не отдаёт предпочтение отдельным городам, коммунам, районам, провинциям
+  или регионам Бельгии;
+- никогда не предлагай название бельгийского места как положительный или
+  отрицательный сигнал релевантности;
+- локальная привязка сама по себе не делает новость ни подходящей, ни
+  неподходящей: решающими являются содержание, необычность, значимость и
+  интерес события;
+- positive_terms оставляй пустым: хорошие материалы теперь распознаются
+  семантической памятью и основным AI-анализом, а не географическими словами.
+
 Верни строго JSON:
 {
   "summary": "Краткое описание изменения",
@@ -198,6 +209,12 @@ def _contains_whole_term(text: str, term: str) -> bool:
     return bool(re.search(pattern, text, flags=re.IGNORECASE))
 
 
+def is_belgian_domestic_source(source_name: str) -> bool:
+    """Return whether the source primarily reports news from inside Belgium."""
+    source = " ".join((source_name or "").lower().split())
+    return source in BELGIAN_DOMESTIC_SOURCES
+
+
 def has_belgian_enforcement_signal(source_name: str, text: str) -> bool:
     """Detect a concrete Belgian administrative or regulatory action.
 
@@ -206,8 +223,7 @@ def has_belgian_enforcement_signal(source_name: str, text: str) -> bool:
     both a public authority and a concrete closure, permit, fire-safety, ban,
     or sanction action.
     """
-    source = " ".join((source_name or "").lower().split())
-    if source not in BELGIAN_DOMESTIC_SOURCES:
+    if not is_belgian_domestic_source(source_name):
         return False
     lowered = (text or "").lower()
     has_authority = any(
@@ -372,14 +388,12 @@ def complete_policy_coverage(
     if not approved_texts or not declined_texts:
         return policy
 
-    # A positive signal overrides a negative one, so keep only positive terms
-    # that are exclusive to the approved history.
-    positive_terms = [
-        term
-        for term in policy.get("positive_terms", [])
-        if any(term in text for text in approved_texts)
-        and not any(term in text for text in declined_texts)
-    ][:MAX_TERMS]
+    # Positive keyword rules are deliberately disabled. They previously
+    # overfit to a few Belgian place names and made location a proxy for
+    # relevance. Positive learning now belongs to semantic memory and the
+    # main AI evaluation; this deterministic policy only keeps replay-safe
+    # exclusions.
+    positive_terms: list[str] = []
 
     coverage: dict[str, set[int]] = defaultdict(set)
     for index, text in enumerate(declined_texts):

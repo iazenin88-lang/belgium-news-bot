@@ -48,6 +48,7 @@ from editorial_memory import (
     embedding_text_hash,
     format_semantic_memory,
     score_semantic_neighbors,
+    semantic_rescue_recommended,
 )
 from prefilter_learning import (
     PROPOSAL_SYSTEM_PROMPT,
@@ -56,6 +57,7 @@ from prefilter_learning import (
     evaluate_policy,
     format_training_examples,
     has_belgian_enforcement_signal,
+    is_belgian_domestic_source,
     parse_policy_proposal,
     policy_prefilter_decision,
     proposal_is_safe,
@@ -107,13 +109,14 @@ SYSTEM_PROMPT = """
 2. категория новости
 3. общественная важность по шкале 1-10
 4. практическая польза по шкале 1-10
-5. является ли материал личным происшествием со спортсменом, знаменитостью
+5. редакционный интерес и необычность по шкале 1-10
+6. является ли материал личным происшествием со спортсменом, знаменитостью
    или другой публичной персоной
-6. прошёл бы тот же сюжет тест неизвестного обычного человека
-7. краткая причина
-8. короткий пересказ на русском
-9. короткий заголовок для Telegram
-10. текст поста для Telegram
+7. прошёл бы тот же сюжет тест неизвестного обычного человека
+8. краткая причина
+9. короткий пересказ на русском
+10. короткий заголовок для Telegram
+11. текст поста для Telegram
 
 Канал предназначен для жизни в Бельгии и для русско- и украиноязычных
 мигрантов, которые находятся в Бельгии.
@@ -143,6 +146,20 @@ SYSTEM_PROMPT = """
   для русскоязычной аудитории в Бельгии
 - отдельные темы развлечений, если они реально заметны для русскоязычной аудитории в Бельгии
   или имеют практический/общественный контекст
+- необычные, выдающиеся или визуально сильные события в Бельгии: заметные
+  культурные и исторические проекты, открытия, рекорды, технологические идеи,
+  крупные реставрации и гражданские инициативы, о которых интересно узнать
+  широкой аудитории, даже если у новости нет немедленной практической пользы
+
+ГЕОГРАФИЧЕСКАЯ НЕЙТРАЛЬНОСТЬ:
+- у канала нет приоритетных городов, коммун, районов, провинций или регионов;
+- Антверпен, Гент, Брюссель и любое маленькое бельгийское место оцениваются по
+  одинаковым критериям;
+- не отклоняй материал только потому, что событие локальное, если само событие
+  необычное, выдающееся, исторически или культурно заметное и способно
+  заинтересовать читателей по всей Бельгии;
+- не публикуй обычную локальную мелочь только из-за названия известного города:
+  место само по себе не является сигналом релевантности.
 
 Считать нерелевантными:
 - обычные мировые новости без практической связи с жизнью в Бельгии
@@ -186,6 +203,9 @@ SYSTEM_PROMPT = """
 - practical_value_score — насколько информация помогает читателю прямо сейчас:
   сэкономить заметную сумму, выбрать услугу, избежать лишних расходов,
   выполнить обязательное действие или уложиться в срок
+- editorial_interest_score — насколько событие необычно, примечательно,
+  исторически, культурно или технологически интересно и достойно рассказа
+  широкой аудитории в Бельгии, даже без массовых последствий
 
 Не занижай practical_value_score только потому, что новость не связана с законом
 или политикой. Конкретное сравнение нескольких предложений на бельгийском рынке
@@ -198,8 +218,10 @@ practical_value_score не ниже 6. То же относится к конк�
 даже если оно ещё не принято. В таком случае ясно укажи, что это предложение,
 а не действующий закон, и используй категорию housing.
 
-Считай новость релевантной, если хотя бы общественная важность или практическая
-польза составляет 6 и материал действительно относится к жизни в Бельгии.
+Считай новость релевантной, если хотя бы общественная важность, практическая
+польза или редакционный интерес составляет 6 и материал действительно относится
+к жизни в Бельгии. Выдающееся бельгийское событие с editorial_interest_score 6+
+обычно следует предложить редактору независимо от конкретного места.
 
 Проверяй, не описывает ли статья то же самое реальное событие, которое уже
 есть в блоке «УЖЕ ПРЕДЛОЖЕННЫЕ ИЛИ ОДОБРЕННЫЕ МАТЕРИАЛЫ». Событие считается
@@ -246,6 +268,7 @@ URL: {url}
   "category": "migration",
   "importance_score": 8,
   "practical_value_score": 7,
+  "editorial_interest_score": 6,
   "is_public_figure_personal_incident": false,
   "passes_ordinary_person_test": true,
   "reason": "Коротко почему новость важна",
@@ -609,6 +632,19 @@ def should_send_to_ai(
     learned_decision, learned_reason = policy_prefilter_decision(
         combined_lower, learned_policy
     )
+    if learned_decision is False:
+        return learned_decision, learned_reason
+
+    if contains_any(combined_lower, HARD_REJECT_KEYWORDS):
+        return False, "Явно нерелевантная тема (спорт и т.п.)"
+
+    # A domestic source is sufficient to establish Belgian context, not
+    # relevance. Send every non-empty, non-hard-rejected domestic item to the
+    # AI so it can distinguish an ordinary local detail from an outstanding
+    # event. This prevents a short list of city names from deciding recall.
+    if is_belgian_domestic_source(source_name):
+        return True, "Бельгийский источник: географически нейтральная AI-оценка"
+
     if learned_decision is True:
         return learned_decision, learned_reason
 
@@ -617,12 +653,6 @@ def should_send_to_ai(
         and (len(summary) >= 80 or len(content) >= 250)
     ):
         return True, "Бельгийское применение закона или административная мера"
-
-    if learned_decision is False:
-        return learned_decision, learned_reason
-
-    if contains_any(combined_lower, HARD_REJECT_KEYWORDS):
-        return False, "Явно нерелевантная тема (спорт и т.п.)"
 
     if learning_mode:
         return True, "Learning mode: пограничный материал передан AI"
@@ -942,7 +972,7 @@ def load_semantic_memory_context(
     article_id: int,
     article: dict[str, Any],
     stats: dict[str, Any],
-) -> str:
+) -> tuple[str, dict[str, Any]]:
     """Retrieve full-history decisions and persist a shadow prediction."""
     vector = ensure_article_embedding(sb, client, article_id, article, stats)
     rows = sb.rpc("match_editorial_decisions", {
@@ -972,7 +1002,7 @@ def load_semantic_memory_context(
         f"approved_examples={score['approval_examples']} "
         f"rejected_examples={score['rejection_examples']}"
     )
-    return format_semantic_memory(rows)
+    return format_semantic_memory(rows), score
 
 
 # -------------------------------------------------------
@@ -1035,7 +1065,14 @@ def analyze_article(
 
     public_importance_score = normalize_int(data.get("importance_score", 1))
     practical_value_score = normalize_int(data.get("practical_value_score", 1))
-    editorial_score = max(public_importance_score, practical_value_score)
+    editorial_interest_score = normalize_int(
+        data.get("editorial_interest_score", 1)
+    )
+    editorial_score = max(
+        public_importance_score,
+        practical_value_score,
+        editorial_interest_score,
+    )
 
     analysis = {
         "is_relevant": is_relevant,
@@ -1043,6 +1080,7 @@ def analyze_article(
         "importance_score": editorial_score,
         "public_importance_score": public_importance_score,
         "practical_value_score": practical_value_score,
+        "editorial_interest_score": editorial_interest_score,
         "reason": relevance_reason,
         "russian_summary": normalize_text(data.get("russian_summary", ""), 4000),
         "telegram_title": normalize_text(data.get("telegram_title", ""), 300),
@@ -1970,13 +2008,31 @@ def main():
         # not stop the existing article pipeline or silently reject anything.
         print(f"WARNING: semantic memory backfill unavailable: {repr(error)}")
 
-    result = (
-        sb.table("articles")
-        .select("*")
-        .order("id", desc=True)
-        .limit(20)
-        .execute()
-    )
+    target_article_id_raw = os.getenv("TARGET_ARTICLE_ID", "").strip()
+    if target_article_id_raw:
+        try:
+            target_article_id = int(target_article_id_raw)
+        except ValueError as error:
+            raise ValueError("TARGET_ARTICLE_ID must be a positive integer") from error
+        if target_article_id <= 0:
+            raise ValueError("TARGET_ARTICLE_ID must be a positive integer")
+
+        result = (
+            sb.table("articles")
+            .select("*")
+            .eq("id", target_article_id)
+            .limit(1)
+            .execute()
+        )
+        print(f"Targeted manual analysis requested: article_id={target_article_id}")
+    else:
+        result = (
+            sb.table("articles")
+            .select("*")
+            .order("id", desc=True)
+            .limit(20)
+            .execute()
+        )
 
     rows = result.data or []
     print(f"Loaded articles: {len(rows)}")
@@ -2078,7 +2134,7 @@ def main():
             # prefilter would have silently hidden articles resembling past
             # approvals—the key false-negative risk before automation.
             try:
-                semantic_memory_context = load_semantic_memory_context(
+                semantic_memory_context, semantic_score = load_semantic_memory_context(
                     sb,
                     oa,
                     article_id,
@@ -2092,6 +2148,7 @@ def main():
                     "Семантическая память временно недоступна; оцени статью "
                     "строго по редакционной политике."
                 )
+                semantic_score = None
                 print(
                     f"WARNING: semantic memory unavailable for "
                     f"article_id={article_id}: {repr(error)}"
@@ -2102,6 +2159,20 @@ def main():
                 learning_mode=learning_mode,
                 learned_policy=learned_policy,
             )
+
+            if (
+                not send_to_ai
+                and prefilter_reason in {
+                    "Недостаточно сигналов релевантности",
+                    "Пограничный случай без достаточных оснований для AI",
+                }
+                and semantic_rescue_recommended(semantic_score)
+            ):
+                send_to_ai = True
+                prefilter_reason = (
+                    "Semantic rescue: материал похож на прошлые одобрения; "
+                    "окончательное решение принимает AI"
+                )
 
             if not send_to_ai:
                 save_prefilter_rejection(sb, article_id, prefilter_reason)
@@ -2205,6 +2276,7 @@ def main():
                 f"importance={analysis['importance_score']}, "
                 f"public_importance={analysis.get('public_importance_score', 1)}, "
                 f"practical_value={analysis.get('practical_value_score', 1)}, "
+                f"editorial_interest={analysis.get('editorial_interest_score', 1)}, "
                 f"category={analysis['category']}"
             )
 

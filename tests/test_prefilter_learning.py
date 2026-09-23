@@ -10,6 +10,7 @@ from prefilter_learning import (
     proposal_is_safe,
     format_training_examples,
     has_belgian_enforcement_signal,
+    is_belgian_domestic_source,
     remove_unsafe_negative_terms,
 )
 
@@ -73,6 +74,12 @@ class PrefilterLearningTests(unittest.TestCase):
     def test_non_domestic_source_does_not_get_domestic_exception(self):
         text = "Police closed a venue after repeated fire safety violations."
         self.assertFalse(has_belgian_enforcement_signal("Politico EU", text))
+
+    def test_all_belgian_sources_are_equal_regardless_of_city(self):
+        self.assertTrue(is_belgian_domestic_source("VRT NWS"))
+        self.assertTrue(is_belgian_domestic_source("HLN"))
+        self.assertTrue(is_belgian_domestic_source("Brussels Times"))
+        self.assertFalse(is_belgian_domestic_source("Politico EU"))
 
     def test_text_corrections_do_not_affect_relevance_metrics(self):
         rows = [
@@ -170,7 +177,7 @@ class PrefilterLearningTests(unittest.TestCase):
         metrics = evaluate_policy(rows, policy)
         self.assertGreaterEqual(metrics["approval_retention"], 0.95)
         self.assertGreaterEqual(metrics["decline_rejection"], 0.20)
-        self.assertNotIn("international", policy["positive_terms"])
+        self.assertEqual(policy["positive_terms"], [])
         self.assertTrue(policy["negative_terms"])
 
     def test_coverage_terms_never_appear_in_approved_sources(self):
@@ -192,6 +199,24 @@ class PrefilterLearningTests(unittest.TestCase):
         self.assertNotIn("school", policy["negative_terms"])
         metrics = evaluate_policy(rows, policy)
         self.assertEqual(metrics["approval_retention"], 1.0)
+
+    def test_completed_policy_never_uses_place_names_as_positive_shortcuts(self):
+        rows = [{
+            "status": "applied",
+            "feedback_type": "approved",
+            "source_title": "Outstanding heritage project in Genk",
+        }, {
+            "status": "applied",
+            "feedback_type": "topic_mismatch",
+            "source_title": "Routine local celebrity story",
+        }]
+        policy = complete_policy_coverage(rows, {
+            "summary": "Do not use geography",
+            "rationale": "Locations are neutral",
+            "positive_terms": ["genk"],
+            "negative_terms": ["celebrity"],
+        })
+        self.assertEqual(policy["positive_terms"], [])
 
 
 if __name__ == "__main__":

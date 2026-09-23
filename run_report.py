@@ -8,6 +8,7 @@ def build_run_report(
     ai_rejected: int,
     passed_to_editor: int,
     run_cost_usd,
+    starting_balance_usd,
     spent_total_usd,
     remaining_estimated_usd,
     errors: int = 0,
@@ -37,8 +38,9 @@ def build_run_report(
     lines.extend([
         "",
         "💰 OpenAI",
-        f"Этот запуск: ${run_cost_usd}",
-        f"Потрачено всего: ${spent_total_usd}",
-        f"Остаток: ${remaining_estimated_usd}",
+        f"Расчётная стоимость запуска: ${run_cost_usd}",
+        f"Бюджет после пополнения: ${starting_balance_usd}",
+        f"Расход после пополнения: ${spent_total_usd}",
+        f"Расчётный остаток: ${remaining_estimated_usd}",
     ])
     return "\n".join(lines)

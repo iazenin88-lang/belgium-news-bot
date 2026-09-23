@@ -359,6 +359,7 @@ def collect_source(
     pacer: RequestPacer,
     extractor=extract_text_from_html,
     brussels_times_extractor=extract_brussels_times_summary,
+    collected_article_ids: list[int] | None = None,
 ) -> tuple[int, int]:
     source_id = source["id"]
     feed = fetch_feed(source["url"], session)
@@ -406,9 +407,14 @@ def collect_source(
             row["content"] = extractor(row["canonical_url"], session)
 
         try:
-            sb.table("articles").insert(row).execute()
+            insert_result = sb.table("articles").insert(row).execute()
             new_count += 1
             known.add(row["fingerprint"])
+            inserted_rows = insert_result.data or []
+            if collected_article_ids is not None and inserted_rows:
+                inserted_id = inserted_rows[0].get("id")
+                if inserted_id is not None:
+                    collected_article_ids.append(int(inserted_id))
         except Exception:
             duplicate_count += 1
 
@@ -426,11 +432,18 @@ def main():
     new_count = 0
     dup_count = 0
     err_count = 0
+    collected_article_ids = []
 
     for source in sources:
         source_name = source.get("name") or f"source-{source['id']}"
         try:
-            source_new, source_dup = collect_source(sb, source, session, pacer)
+            source_new, source_dup = collect_source(
+                sb,
+                source,
+                session,
+                pacer,
+                collected_article_ids=collected_article_ids,
+            )
             new_count += source_new
             dup_count += source_dup
             print(
@@ -448,6 +461,11 @@ def main():
     if github_env:
         with open(github_env, "a", encoding="utf-8") as env_file:
             env_file.write(f"COLLECTED_ARTICLES_COUNT={new_count}\n")
+            env_file.write(
+                "COLLECTED_ARTICLE_IDS="
+                + ",".join(str(value) for value in collected_article_ids)
+                + "\n"
+            )
 
     print(f"Done. new={new_count} dup={dup_count} err={err_count}")
 

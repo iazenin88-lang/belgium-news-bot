@@ -442,6 +442,13 @@ def main():
             err_count += 1
             print(f"Source {source_name}: error={type(exc).__name__}: {exc}")
 
+    # In the full GitHub Actions pipeline this makes the exact collector count
+    # available to the analyzer step.  Standalone/local runs simply skip it.
+    github_env = os.getenv("GITHUB_ENV")
+    if github_env:
+        with open(github_env, "a", encoding="utf-8") as env_file:
+            env_file.write(f"COLLECTED_ARTICLES_COUNT={new_count}\n")
+
     print(f"Done. new={new_count} dup={dup_count} err={err_count}")
 
 

@@ -71,6 +71,7 @@ from semantic_dedup import (
     parse_article_id,
     reconcile_duplicate_decision,
 )
+from run_report import build_run_report
 
 
 # -------------------------------------------------------
@@ -1768,23 +1769,28 @@ def send_run_balance_message(
     run_cost_usd: Decimal,
     spent_total_usd: Decimal,
     remaining_estimated_usd: Decimal,
-    ai_calls: int,
+    collected: int,
     prefilter_rejected: int,
+    ai_rejected: int,
+    passed_to_editor: int,
+    errors: int = 0,
     corrections_processed: int = 0,
     corrections_failed: int = 0,
 ) -> None:
     """
     Отправляет Telegram-сообщение после прогона analyzer.
     """
-    text = (
-        "📊 OpenAI balance update\n\n"
-        f"Last run cost: ${run_cost_usd}\n"
-        f"Spent total: ${spent_total_usd}\n"
-        f"Estimated remaining: ${remaining_estimated_usd}\n\n"
-        f"AI calls this run: {ai_calls}\n"
-        f"Pre-filter rejected: {prefilter_rejected}\n"
-        f"Editor corrections applied: {corrections_processed}\n"
-        f"Editor corrections failed/retrying: {corrections_failed}"
+    text = build_run_report(
+        collected=collected,
+        prefilter_rejected=prefilter_rejected,
+        ai_rejected=ai_rejected,
+        passed_to_editor=passed_to_editor,
+        run_cost_usd=run_cost_usd,
+        spent_total_usd=spent_total_usd,
+        remaining_estimated_usd=remaining_estimated_usd,
+        errors=errors,
+        corrections_processed=corrections_processed,
+        corrections_failed=corrections_failed,
     )
 
     telegram_send_message(bot_token, chat_id, text)
@@ -2012,6 +2018,16 @@ def main():
         print(f"WARNING: semantic memory backfill unavailable: {repr(error)}")
 
     target_article_id_raw = os.getenv("TARGET_ARTICLE_ID", "").strip()
+    collected_count_raw = os.getenv("COLLECTED_ARTICLES_COUNT", "").strip()
+    collected_count = None
+    if collected_count_raw:
+        try:
+            collected_count = max(0, int(collected_count_raw))
+        except ValueError:
+            print(
+                "WARNING: COLLECTED_ARTICLES_COUNT is not an integer; "
+                "falling back to analyzer count"
+            )
     if target_article_id_raw:
         try:
             target_article_id = int(target_article_id_raw)
@@ -2029,11 +2045,12 @@ def main():
         )
         print(f"Targeted manual analysis requested: article_id={target_article_id}")
     else:
+        article_limit = max(20, collected_count or 0)
         result = (
             sb.table("articles")
             .select("*")
             .order("id", desc=True)
-            .limit(20)
+            .limit(article_limit)
             .execute()
         )
 
@@ -2067,6 +2084,9 @@ def main():
     processed = 0
     skipped = 0
     queued = 0
+    new_articles_seen = 0
+    ai_rejected = 0
+    passed_to_editor = 0
     prefilter_rejected = 0
     ai_calls = int(correction_stats["ai_calls"])
     total_input_tokens = int(correction_stats["input_tokens"])
@@ -2115,6 +2135,8 @@ def main():
                     del event_history[EVENT_HISTORY_LIMIT:]
 
             continue
+
+        new_articles_seen += 1
 
         article = {
             "source_name": source_names.get(
@@ -2286,12 +2308,15 @@ def main():
             if analysis["is_relevant"] and analysis["importance_score"] >= 6:
                 if add_to_editor_queue(sb, article_id):
                     queued += 1
+                    passed_to_editor += 1
                     event_history.insert(0, make_event_history_entry(
                         article_id,
                         article,
                         analysis,
                     ))
                     del event_history[EVENT_HISTORY_LIMIT:]
+            else:
+                ai_rejected += 1
 
         except Exception as e:
             error_text = repr(e)
@@ -2351,6 +2376,7 @@ def main():
     print(
         f"Done. processed={processed} skipped={skipped} "
         f"queued={queued} prefilter_rejected={prefilter_rejected} "
+        f"ai_rejected={ai_rejected} passed_to_editor={passed_to_editor} "
         f"corrections_processed={corrections_processed} "
         f"corrections_failed={corrections_failed} "
         f"ai_calls={ai_calls} cost_usd={total_cost_usd} errors={errors}"
@@ -2365,8 +2391,15 @@ def main():
                 run_cost_usd=total_cost_usd,
                 spent_total_usd=spent_total_usd,
                 remaining_estimated_usd=remaining_estimated_usd,
-                ai_calls=ai_calls,
+                collected=(
+                    collected_count
+                    if collected_count is not None
+                    else new_articles_seen
+                ),
                 prefilter_rejected=prefilter_rejected,
+                ai_rejected=ai_rejected,
+                passed_to_editor=passed_to_editor,
+                errors=errors,
                 corrections_processed=corrections_processed,
                 corrections_failed=corrections_failed,
             )

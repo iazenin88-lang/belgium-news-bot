@@ -629,12 +629,6 @@ def should_send_to_ai(
     if not title and not summary and not content:
         return False, "Нет заголовка, summary и content"
 
-    learned_decision, learned_reason = policy_prefilter_decision(
-        combined_lower, learned_policy
-    )
-    if learned_decision is False:
-        return learned_decision, learned_reason
-
     if contains_any(combined_lower, HARD_REJECT_KEYWORDS):
         return False, "Явно нерелевантная тема (спорт и т.п.)"
 
@@ -644,6 +638,15 @@ def should_send_to_ai(
     # event. This prevents a short list of city names from deciding recall.
     if is_belgian_domestic_source(source_name):
         return True, "Бельгийский источник: географически нейтральная AI-оценка"
+
+    # Learned phrases remain useful for external or international feeds, but
+    # they must not silently veto a Belgian-source item before the main AI can
+    # judge whether the event itself is exceptional or useful.
+    learned_decision, learned_reason = policy_prefilter_decision(
+        combined_lower, learned_policy
+    )
+    if learned_decision is False:
+        return learned_decision, learned_reason
 
     if learned_decision is True:
         return learned_decision, learned_reason

@@ -66,7 +66,9 @@ class EditorialMemoryTests(unittest.TestCase):
             Path(__file__).resolve().parents[1] / "analyzer.py"
         ).read_text(encoding="utf-8")
         domestic_gate = source.index("if is_belgian_domestic_source(source_name)")
+        learned_rejection = source.index("if learned_decision is False")
         keyword_heuristics = source.index("pass_matches = count_matches")
+        self.assertLess(domestic_gate, learned_rejection)
         self.assertLess(domestic_gate, keyword_heuristics)
 
     def test_location_neutrality_is_explicit_in_relevance_prompt(self):

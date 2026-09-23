@@ -3,6 +3,11 @@ name: Analyze news
 # Manual diagnostic workflow. Automatic analysis is handled by full_pipeline.yml.
 on:
   workflow_dispatch:
+    inputs:
+      article_id:
+        description: "Optional article ID for a targeted manual analysis"
+        required: false
+        type: string
 
 jobs:
   run:
@@ -28,5 +33,6 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TARGET_ARTICLE_ID: ${{ inputs.article_id }}
         run: |
           python analyzer.py

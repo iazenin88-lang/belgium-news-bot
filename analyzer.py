@@ -2008,13 +2008,31 @@ def main():
         # not stop the existing article pipeline or silently reject anything.
         print(f"WARNING: semantic memory backfill unavailable: {repr(error)}")
 
-    result = (
-        sb.table("articles")
-        .select("*")
-        .order("id", desc=True)
-        .limit(20)
-        .execute()
-    )
+    target_article_id_raw = os.getenv("TARGET_ARTICLE_ID", "").strip()
+    if target_article_id_raw:
+        try:
+            target_article_id = int(target_article_id_raw)
+        except ValueError as error:
+            raise ValueError("TARGET_ARTICLE_ID must be a positive integer") from error
+        if target_article_id <= 0:
+            raise ValueError("TARGET_ARTICLE_ID must be a positive integer")
+
+        result = (
+            sb.table("articles")
+            .select("*")
+            .eq("id", target_article_id)
+            .limit(1)
+            .execute()
+        )
+        print(f"Targeted manual analysis requested: article_id={target_article_id}")
+    else:
+        result = (
+            sb.table("articles")
+            .select("*")
+            .order("id", desc=True)
+            .limit(20)
+            .execute()
+        )
 
     rows = result.data or []
     print(f"Loaded articles: {len(rows)}")

@@ -147,13 +147,17 @@ class FakeQuery:
             )
         if self.operation == "insert":
             self.database.inserted.append(self.row)
-            return SimpleNamespace(data=[self.row])
+            returned_row = dict(self.row)
+            if self.database.assign_ids:
+                returned_row["id"] = len(self.database.inserted)
+            return SimpleNamespace(data=[returned_row])
         raise AssertionError("Unexpected fake database operation")
 
 
 class FakeDatabase:
-    def __init__(self, existing=None):
+    def __init__(self, existing=None, assign_ids=False):
         self.existing = set(existing or [])
+        self.assign_ids = assign_ids
         self.inserted = []
 
     def table(self, table_name):
@@ -324,6 +328,29 @@ class CollectorAccessTests(unittest.TestCase):
         self.assertEqual((new, duplicate), (1, 0))
         self.assertEqual(len(database.inserted), 1)
         self.assertIsNone(database.inserted[0]["content"])
+
+    def test_collector_returns_inserted_ids_for_the_current_pipeline_run(self):
+        database = FakeDatabase(assign_ids=True)
+        source = {
+            "id": 1,
+            "name": "VRT NWS",
+            "url": "https://www.vrt.be/vrtnws/nl.rss.articles.xml",
+        }
+        collected_article_ids = []
+
+        with patch(
+            "collector.fetch_feed",
+            return_value=SimpleNamespace(entries=[feed_entry()]),
+        ):
+            collect_source(
+                database,
+                source,
+                FakeSession(),
+                RequestPacer(0),
+                collected_article_ids=collected_article_ids,
+            )
+
+        self.assertEqual(collected_article_ids, [1])
 
     def test_duplicate_is_checked_before_opening_article_page(self):
         entry = feed_entry()

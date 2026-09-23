@@ -2019,7 +2019,9 @@ def main():
 
     target_article_id_raw = os.getenv("TARGET_ARTICLE_ID", "").strip()
     collected_count_raw = os.getenv("COLLECTED_ARTICLES_COUNT", "").strip()
+    collected_ids_raw = os.getenv("COLLECTED_ARTICLE_IDS", "").strip()
     collected_count = None
+    collected_article_ids = None
     if collected_count_raw:
         try:
             collected_count = max(0, int(collected_count_raw))
@@ -2027,6 +2029,23 @@ def main():
             print(
                 "WARNING: COLLECTED_ARTICLES_COUNT is not an integer; "
                 "falling back to analyzer count"
+            )
+    if collected_count is not None:
+        try:
+            collected_article_ids = [
+                int(value)
+                for value in collected_ids_raw.split(",")
+                if value.strip()
+            ]
+            if len(collected_article_ids) != collected_count:
+                raise ValueError(
+                    "collector count and collected ID count do not match"
+                )
+        except ValueError as error:
+            collected_article_ids = None
+            print(
+                "WARNING: exact collected article IDs are unavailable; "
+                f"falling back to the recent article batch: {error}"
             )
     if target_article_id_raw:
         try:
@@ -2044,6 +2063,22 @@ def main():
             .execute()
         )
         print(f"Targeted manual analysis requested: article_id={target_article_id}")
+    elif collected_article_ids is not None:
+        if collected_article_ids:
+            result = (
+                sb.table("articles")
+                .select("*")
+                .in_("id", collected_article_ids)
+                .order("id", desc=True)
+                .execute()
+            )
+        else:
+            result = (
+                sb.table("articles")
+                .select("*")
+                .eq("id", -1)
+                .execute()
+            )
     else:
         article_limit = max(20, collected_count or 0)
         result = (

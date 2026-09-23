@@ -72,6 +72,7 @@ from semantic_dedup import (
     reconcile_duplicate_decision,
 )
 from run_report import build_run_report
+from sports_filter import is_routine_sports_coverage
 
 
 # -------------------------------------------------------
@@ -630,6 +631,9 @@ def should_send_to_ai(
 
     if not title and not summary and not content:
         return False, "Нет заголовка, summary и content"
+
+    if is_routine_sports_coverage(title, summary):
+        return False, "Обычный спортивный результат или репортаж"
 
     if contains_any(combined_lower, HARD_REJECT_KEYWORDS):
         return False, "Явно нерелевантная тема (спорт и т.п.)"

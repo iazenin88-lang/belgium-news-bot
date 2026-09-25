@@ -113,8 +113,9 @@ class EditorialPolicyContextTests(unittest.TestCase):
 
     def test_length_limit_accepts_short_and_rejects_long_publication(self):
         validate_publication_length("Короткий заголовок", "Короткий текст новости.")
+        validate_publication_length("Заголовок", "слово " * 79)
         with self.assertRaises(ValueError):
-            validate_publication_length("Заголовок", "слово " * 71)
+            validate_publication_length("Заголовок", "слово " * 80)
 
     def test_topic_history_cannot_crowd_out_style_memory(self):
         rows = [{

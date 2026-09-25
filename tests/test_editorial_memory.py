@@ -11,17 +11,22 @@ from editorial_memory import (
 )
 
 class EditorialMemoryTests(unittest.TestCase):
-    def test_main_scores_shadow_memory_before_prefilter(self):
+    def test_main_uses_shadow_memory_to_rescue_nano_rejections(self):
         source = (
             Path(__file__).resolve().parents[1] / "analyzer.py"
         ).read_text(encoding="utf-8")
-        semantic_call = source.index(
+        main_source = source[source.index("def main():"):]
+        semantic_call = main_source.index(
             "semantic_memory_context, semantic_score = load_semantic_memory_context"
         )
-        prefilter_call = source.index(
-            "send_to_ai, prefilter_reason = should_send_to_ai"
+        nano_decision = main_source.index(
+            'nano_decision = triage_result.get("decision", "uncertain")'
         )
-        self.assertLess(semantic_call, prefilter_call)
+        semantic_rescue = main_source.index(
+            "and semantic_rescue_recommended(semantic_score)"
+        )
+        self.assertLess(semantic_call, nano_decision)
+        self.assertLess(nano_decision, semantic_rescue)
 
     def test_embedding_text_is_stable_and_uses_source_content(self):
         article = {

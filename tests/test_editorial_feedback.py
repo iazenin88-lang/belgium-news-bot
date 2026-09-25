@@ -4,6 +4,7 @@ import unittest
 from editorial_feedback import (
     build_correction_prompt,
     build_editorial_policy_context,
+    build_relevance_triage_context,
     parse_correction_response,
     validate_publication_length,
 )
@@ -132,6 +133,34 @@ class EditorialPolicyContextTests(unittest.TestCase):
 
         context = build_editorial_policy_context(rows)
         self.assertIn("Писать короче", context)
+
+    def test_nano_context_contains_relevance_feedback_but_not_style(self):
+        rows = [
+            {
+                "feedback_type": "topic_mismatch",
+                "status": "applied",
+                "draft_title": "Локальный матч",
+                "editor_comment": "Обычный спортивный результат",
+            },
+            {
+                "feedback_type": "approved",
+                "status": "applied",
+                "draft_title": "Новые правила аренды",
+            },
+            {
+                "feedback_type": "text_correction",
+                "status": "applied",
+                "editor_comment": "Писать короче",
+                "draft_text": "Длинный текст",
+                "revised_text": "Короткий текст",
+            },
+        ]
+
+        context = build_relevance_triage_context(rows)
+
+        self.assertIn("Локальный матч", context)
+        self.assertIn("Новые правила аренды", context)
+        self.assertNotIn("Писать короче", context)
 
 
 class CorrectionPromptTests(unittest.TestCase):

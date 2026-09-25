@@ -190,6 +190,52 @@ def build_editorial_policy_context(
     return result if result != header else ""
 
 
+def build_relevance_triage_context(
+    rows: Iterable[dict[str, Any]],
+    *,
+    max_examples: int = MAX_FEEDBACK_EXAMPLES,
+    max_chars: int = MAX_FEEDBACK_CONTEXT_CHARS,
+) -> str:
+    """Build relevance-only calibration examples for the Nano gate.
+
+    Text corrections belong in the later writing prompt, not in a cheap first
+    pass whose only job is deciding whether an article deserves full analysis.
+    """
+
+    negatives: list[str] = []
+    positives: list[str] = []
+    for row in rows:
+        if row.get("status") != "applied":
+            continue
+        if row.get("feedback_type") == "topic_mismatch":
+            negatives.append(_format_example(row, "ОТКЛОНЕНО ПО ТЕМАТИКЕ", True))
+        elif row.get("feedback_type") == "approved":
+            positives.append(_format_example(row, "ОПУБЛИКОВАНО", False))
+
+    if not negatives and not positives:
+        return ""
+
+    negative_limit = min(len(negatives), 6, max_examples)
+    positive_limit = min(len(positives), 6, max_examples - negative_limit)
+    selected = negatives[:negative_limit] + positives[:positive_limit]
+    header = (
+        "РЕДАКТОРСКАЯ КАЛИБРОВКА РЕЛЕВАНТНОСТИ\n"
+        "Ниже — реальные тематические решения редактора. Используй отклонения "
+        "как отрицательные примеры, а публикации как положительные. Обобщай "
+        "узко и по смыслу: единичный отказ не запрещает широкую категорию. "
+        "Каждую текущую статью оценивай самостоятельно."
+    )
+
+    result = header
+    for index, example in enumerate(selected, start=1):
+        candidate = f"{result}\n\nПример {index}\n{example}"
+        if len(candidate) > max_chars:
+            break
+        result = candidate
+
+    return result if result != header else ""
+
+
 def validate_publication_length(title: str, body: str) -> None:
     """Reject drafts that cannot be read in roughly 15–20 seconds."""
     word_count = len(re.findall(r"\b[\wЁёА-Яа-я'-]+\b", f"{title} {body}", re.UNICODE))

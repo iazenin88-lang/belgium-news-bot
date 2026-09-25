@@ -850,7 +850,7 @@ def triage_articles_with_nano(
             )
         except Exception as error:
             error_text = repr(error)
-            if "insufficient_quota" in error_text or "RateLimitError" in error_text:
+            if "insufficient_quota" in error_text:
                 raise
             print(
                 f"WARNING: Nano batch {batch_number} request failed; "
@@ -1758,7 +1758,7 @@ def process_pending_corrections(
             error_text = repr(error)[:4000]
             print(f"ERROR correction feedback_id={current_feedback_id}: {error_text}")
 
-            if "insufficient_quota" in error_text:
+            if "insufficient_quota" in error_text or "RateLimitError" in error_text:
                 sb.table("editorial_feedback").update({
                     "status": "pending_processing",
                     "attempts": max(0, attempts - 1),

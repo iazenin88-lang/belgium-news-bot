@@ -20,7 +20,7 @@ def build_run_report(
         "📊 Итоги обработки новостей",
         "",
         f"🆕 Собрано новых статей: {collected}",
-        f"🗑 Отсеяно префильтром: {prefilter_rejected}",
+        f"🗑 Отсеяно Nano: {prefilter_rejected}",
         f"🤖 Отсеяно AI: {ai_rejected}",
         f"✅ Передано в редакторский чат: {passed_to_editor}",
     ]

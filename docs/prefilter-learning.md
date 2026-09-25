@@ -1,5 +1,25 @@
 # Human-approved pre-filter learning
 
+## Current runtime: Nano batch triage
+
+The scheduled analyzer no longer applies the learned phrase policy before the
+main model. Every newly collected article is sent to `gpt-5-nano` in groups of
+at most 20. The model must make an independent `pass`, `uncertain`, or `reject`
+decision for every article ID; there is no per-group quota. Both `pass` and
+`uncertain` continue to `gpt-5-mini`.
+
+The batch prompt includes recent editor decisions and is deliberately tuned for
+high recall. Missing IDs, malformed output, and non-billing request failures are
+fail-open: affected articles continue to Mini. A Nano rejection is also
+overridden when semantic editorial memory finds sufficient similarity to past
+approvals. Targeted manual analysis bypasses Nano entirely.
+
+The legacy proposal tables and Telegram controls remain in the database for
+history and rollback, but scheduled runs no longer generate or apply phrase
+proposals.
+
+## Legacy proposal design
+
 The analyzer starts in exploration mode. It keeps only the empty-content and
 obvious hard-topic rejections; borderline articles reach the existing AI
 relevance decision, not the editor automatically.

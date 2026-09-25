@@ -33,6 +33,7 @@ from editorial_feedback import (
     CORRECTION_SYSTEM_PROMPT,
     build_correction_prompt,
     build_editorial_policy_context,
+    build_relevance_triage_context,
     enforce_ordinary_person_relevance_guard,
     parse_correction_response,
     validate_publication_length,
@@ -49,6 +50,16 @@ from editorial_memory import (
     format_semantic_memory,
     score_semantic_neighbors,
     semantic_rescue_recommended,
+)
+from nano_triage import (
+    NANO_TRIAGE_MODEL,
+    NANO_TRIAGE_SYSTEM_PROMPT,
+    NANO_TRIAGE_TEXT_FORMAT,
+    article_batches,
+    build_nano_triage_prompt,
+    calc_nano_cost_usd,
+    fail_open_triage,
+    parse_nano_triage,
 )
 from prefilter_learning import (
     PROPOSAL_SYSTEM_PROMPT,
@@ -807,6 +818,87 @@ def calc_cost_usd(
     return quantize_money(input_cost + cached_input_cost + output_cost)
 
 
+def triage_articles_with_nano(
+    client: OpenAI,
+    articles: list[dict[str, Any]],
+    editorial_policy_context: str = "",
+) -> tuple[dict[int, dict[str, str]], int, int, Decimal, int]:
+    """Evaluate every new article in independent groups of at most 20."""
+    decisions: dict[int, dict[str, str]] = {}
+    total_input_tokens = 0
+    total_output_tokens = 0
+    total_cost_usd = Decimal("0")
+    calls = 0
+
+    for batch_number, batch in enumerate(article_batches(articles), start=1):
+        article_ids = [int(article["article_id"]) for article in batch]
+        try:
+            response = client.responses.create(
+                model=NANO_TRIAGE_MODEL,
+                reasoning={"effort": "minimal"},
+                input=[
+                    {"role": "system", "content": NANO_TRIAGE_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": build_nano_triage_prompt(
+                            batch,
+                            editorial_policy_context,
+                        ),
+                    },
+                ],
+                text=NANO_TRIAGE_TEXT_FORMAT,
+            )
+        except Exception as error:
+            error_text = repr(error)
+            if "insufficient_quota" in error_text or "RateLimitError" in error_text:
+                raise
+            print(
+                f"WARNING: Nano batch {batch_number} request failed; "
+                f"forwarding {len(batch)} article(s) to Mini: {error_text}"
+            )
+            decisions.update(fail_open_triage(article_ids))
+            continue
+
+        calls += 1
+        input_tokens, cached_input_tokens, output_tokens = extract_usage_tokens(
+            response
+        )
+        total_input_tokens += input_tokens
+        total_output_tokens += output_tokens
+        total_cost_usd = quantize_money(
+            total_cost_usd
+            + calc_nano_cost_usd(
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+            )
+        )
+
+        try:
+            batch_decisions = parse_nano_triage(
+                pick_text(response),
+                article_ids,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            print(
+                f"WARNING: Nano batch {batch_number} returned invalid output; "
+                f"forwarding {len(batch)} article(s) to Mini: {error!r}"
+            )
+            batch_decisions = fail_open_triage(
+                article_ids,
+                "Nano returned invalid output",
+            )
+        decisions.update(batch_decisions)
+
+    return (
+        decisions,
+        total_input_tokens,
+        total_output_tokens,
+        total_cost_usd,
+        calls,
+    )
+
+
 def extract_embedding_usage_tokens(response: Any) -> int:
     """Return billable input tokens from an Embeddings API response."""
     usage = getattr(response, "usage", None)
@@ -1288,6 +1380,31 @@ def load_editorial_policy_context(sb) -> str:
     return context
 
 
+def load_nano_triage_context(sb) -> str:
+    """Load only topic decisions used to calibrate the Nano relevance gate."""
+    rows = (
+        sb.table("editorial_feedback")
+        .select(
+            "feedback_type,status,editor_comment,source_title,source_summary,"
+            "draft_title,draft_text,created_at"
+        )
+        .eq("status", "applied")
+        .in_("feedback_type", ["approved", "topic_mismatch"])
+        .order("created_at", desc=True)
+        .limit(40)
+        .execute()
+    ).data or []
+
+    context = build_relevance_triage_context(rows)
+    print(
+        "Loaded Nano relevance context: "
+        f"topic_rejections={sum(row.get('feedback_type') == 'topic_mismatch' for row in rows)} "
+        f"approvals={sum(row.get('feedback_type') == 'approved' for row in rows)} "
+        f"chars={len(context)}"
+    )
+    return context
+
+
 EVENT_COVERAGE_STATUSES = [
     # Pending/sent rows prevent two copies of the same event from appearing in
     # one editor session. Approved/published rows are the durable coverage
@@ -1641,7 +1758,7 @@ def process_pending_corrections(
             error_text = repr(error)[:4000]
             print(f"ERROR correction feedback_id={current_feedback_id}: {error_text}")
 
-            if "insufficient_quota" in error_text or "RateLimitError" in error_text:
+            if "insufficient_quota" in error_text:
                 sb.table("editorial_feedback").update({
                     "status": "pending_processing",
                     "attempts": max(0, attempts - 1),
@@ -2021,13 +2138,39 @@ def maybe_create_prefilter_proposal(
 # -------------------------------------------------------
 # Основная функция
 # -------------------------------------------------------
+def build_article_record(
+    row: dict[str, Any],
+    source_names: dict[int, str],
+) -> dict[str, Any]:
+    """Normalize one database row for Nano triage and Mini analysis."""
+    source_id = row.get("source_id")
+    source_name = (
+        source_names.get(int(source_id), "news")
+        if source_id is not None
+        else "news"
+    )
+    return {
+        "article_id": int(row["id"]),
+        "source_name": source_name,
+        "title": row.get("title"),
+        "summary": row.get("summary"),
+        "content": row.get("content"),
+        "canonical_url": row.get("canonical_url"),
+        "original_url": row.get("original_url"),
+        "published_at": row.get("published_at"),
+        "relevance_embedding": row.get("relevance_embedding"),
+        "relevance_embedding_model": row.get("relevance_embedding_model"),
+        "relevance_embedding_hash": row.get("relevance_embedding_hash"),
+    }
+
+
 def main():
     """
     Главная логика:
     - берёт статьи
     - не анализирует уже обработанные повторно
-    - применяет pre-filter
-    - вызывает OpenAI только для кандидатов
+    - проверяет все новые статьи пакетами через GPT-5 nano
+    - отправляет pass/uncertain в GPT-5 mini для подробного анализа
     - добавляет релевантные статьи в editor_queue
     - считает стоимость OpenAI и отправляет баланс в Telegram
     """
@@ -2038,11 +2181,7 @@ def main():
 
     run_id = create_ai_run(sb)
     editorial_policy_context = load_editorial_policy_context(sb)
-    learning_mode, learned_policy, prefilter_settings = load_prefilter_state(sb)
-    print(
-        f"Prefilter state: learning_mode={learning_mode} "
-        f"active_policy={bool(learned_policy)}"
-    )
+    nano_triage_context = load_nano_triage_context(sb)
     correction_stats = process_pending_corrections(sb, oa)
 
     embedding_stats: dict[str, Any] = {
@@ -2177,6 +2316,92 @@ def main():
     errors = 0
     quota_error = bool(correction_stats["quota_error"])
 
+    row_ids = [int(row["id"]) for row in rows if row.get("id") is not None]
+    existing_article_ids: set[int] = set()
+    if row_ids:
+        try:
+            existing_rows = (
+                sb.table("article_analysis")
+                .select("article_id")
+                .in_("article_id", row_ids)
+                .execute()
+            ).data or []
+            existing_article_ids = {
+                int(existing_row["article_id"])
+                for existing_row in existing_rows
+                if existing_row.get("article_id") is not None
+            }
+        except Exception as error:
+            # A failed optimization must not hide an article. The established
+            # per-row check below remains authoritative.
+            print(
+                "WARNING: existing-analysis batch lookup failed; "
+                f"Nano may see already analyzed rows: {error!r}"
+            )
+
+    new_articles_for_triage = [
+        build_article_record(row, source_names)
+        for row in rows
+        if int(row["id"]) not in existing_article_ids
+    ]
+    triage_decisions: dict[int, dict[str, str]] = {}
+    if target_article_id_raw:
+        triage_decisions = {
+            int(article["article_id"]): {
+                "decision": "pass",
+                "reason": "Targeted manual analysis bypasses Nano triage",
+            }
+            for article in new_articles_for_triage
+        }
+    elif new_articles_for_triage and not quota_error:
+        try:
+            (
+                triage_decisions,
+                triage_input_tokens,
+                triage_output_tokens,
+                triage_cost_usd,
+                triage_calls,
+            ) = triage_articles_with_nano(
+                oa,
+                new_articles_for_triage,
+                nano_triage_context,
+            )
+            ai_calls += triage_calls
+            total_input_tokens += triage_input_tokens
+            total_output_tokens += triage_output_tokens
+            total_cost_usd = quantize_money(
+                total_cost_usd + triage_cost_usd
+            )
+            triage_counts = {
+                decision: sum(
+                    row.get("decision") == decision
+                    for row in triage_decisions.values()
+                )
+                for decision in ("pass", "uncertain", "reject")
+            }
+            print(
+                "Nano triage completed: "
+                f"articles={len(new_articles_for_triage)} "
+                f"batches={triage_calls} pass={triage_counts['pass']} "
+                f"uncertain={triage_counts['uncertain']} "
+                f"reject={triage_counts['reject']} "
+                f"cost_usd={triage_cost_usd}"
+            )
+        except Exception as error:
+            error_text = repr(error)
+            if "insufficient_quota" in error_text or "RateLimitError" in error_text:
+                print("Stopping because OpenAI API quota/billing is not available.")
+                quota_error = True
+            else:
+                print(
+                    "WARNING: Nano triage failed; forwarding all new articles "
+                    f"to Mini: {error_text}"
+                )
+                triage_decisions = fail_open_triage(
+                    article["article_id"]
+                    for article in new_articles_for_triage
+                )
+
     for row in rows:
         if quota_error:
             break
@@ -2218,20 +2443,7 @@ def main():
 
         new_articles_seen += 1
 
-        article = {
-            "source_name": source_names.get(
-                int(row.get("source_id")), "news"
-            ) if row.get("source_id") is not None else "news",
-            "title": row.get("title"),
-            "summary": row.get("summary"),
-            "content": row.get("content"),
-            "canonical_url": row.get("canonical_url"),
-            "original_url": row.get("original_url"),
-            "published_at": row.get("published_at"),
-            "relevance_embedding": row.get("relevance_embedding"),
-            "relevance_embedding_model": row.get("relevance_embedding_model"),
-            "relevance_embedding_hash": row.get("relevance_embedding_hash"),
-        }
+        article = build_article_record(row, source_names)
 
         try:
             # Score every unseen article before prefiltering. The prediction is
@@ -2259,18 +2471,22 @@ def main():
                     f"article_id={article_id}: {repr(error)}"
                 )
 
-            send_to_ai, prefilter_reason = should_send_to_ai(
-                article,
-                learning_mode=learning_mode,
-                learned_policy=learned_policy,
+            triage_result = triage_decisions.get(
+                int(article_id),
+                {
+                    "decision": "uncertain",
+                    "reason": "Nano decision unavailable; fail-open to Mini",
+                },
+            )
+            nano_decision = triage_result.get("decision", "uncertain")
+            send_to_ai = nano_decision != "reject"
+            prefilter_reason = (
+                f"Nano {nano_decision}: "
+                f"{triage_result.get('reason') or 'без пояснения'}"
             )
 
             if (
                 not send_to_ai
-                and prefilter_reason in {
-                    "Недостаточно сигналов релевантности",
-                    "Пограничный случай без достаточных оснований для AI",
-                }
                 and semantic_rescue_recommended(semantic_score)
             ):
                 send_to_ai = True
@@ -2410,20 +2626,6 @@ def main():
 
     bot_token = get_env("TELEGRAM_BOT_TOKEN", required=False)
     chat_id = get_env("TELEGRAM_CHAT_ID", required=False)
-    if bot_token and chat_id and not quota_error:
-        try:
-            proposal_input, proposal_output, proposal_cost = (
-                maybe_create_prefilter_proposal(
-                    sb, oa, prefilter_settings, bot_token, chat_id
-                )
-            )
-            if proposal_input or proposal_output:
-                ai_calls += 1
-                total_input_tokens += proposal_input
-                total_output_tokens += proposal_output
-                total_cost_usd = quantize_money(total_cost_usd + proposal_cost)
-        except Exception as e:
-            print(f"WARNING: prefilter proposal failed safely: {repr(e)}")
 
     ai_calls += int(embedding_stats["ai_calls"])
     total_input_tokens += int(embedding_stats["input_tokens"])

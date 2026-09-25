@@ -17,7 +17,7 @@ class RunReportTests(unittest.TestCase):
         )
 
         self.assertIn("Собрано новых статей: 20", report)
-        self.assertIn("Отсеяно префильтром: 2", report)
+        self.assertIn("Отсеяно Nano: 2", report)
         self.assertIn("Отсеяно AI: 17", report)
         self.assertIn("Передано в редакторский чат: 1", report)
         self.assertIn("Бюджет после пополнения: $9.950000", report)

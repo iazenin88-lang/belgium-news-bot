@@ -11,7 +11,12 @@ if "supabase" not in sys.modules:
     sys.modules["supabase"] = supabase_stub
 
 import notifier
-from notifier import build_message, build_reply_markup, notify_queue_item
+from notifier import (
+    build_message,
+    build_reply_markup,
+    notify_queue_item,
+    prioritize_pending_queue_rows,
+)
 
 
 class FakeResponse:
@@ -73,6 +78,42 @@ class FakeSupabase:
 
 
 class NotifierRevisionTests(unittest.TestCase):
+    def test_practical_housing_news_bypasses_older_low_priority_items(self):
+        oldest = [{"id": i, "article_id": i + 100} for i in range(1, 6)]
+        recent = oldest + [{"id": 12, "article_id": 112}]
+        analyses = [
+            {"article_id": i + 100, "category": "other", "importance_score": 6}
+            for i in range(1, 6)
+        ] + [{"article_id": 112, "category": "housing", "importance_score": 7}]
+
+        self.assertEqual(
+            prioritize_pending_queue_rows(oldest, recent, analyses),
+            [1, 12, 2, 3, 4],
+        )
+
+    def test_oldest_items_continue_when_priorities_fill_batch(self):
+        oldest = [{"id": i, "article_id": i + 100} for i in range(1, 6)]
+        recent = oldest + [{"id": i, "article_id": i + 100} for i in range(6, 12)]
+        analyses = [
+            {"article_id": i + 100, "category": "taxes", "importance_score": 8}
+            for i in range(6, 12)
+        ]
+
+        self.assertEqual(
+            prioritize_pending_queue_rows(oldest, recent, analyses),
+            [1, 6, 7, 8, 9],
+        )
+
+    def test_unrelated_news_does_not_jump_queue(self):
+        oldest = [{"id": i, "article_id": i + 100} for i in range(1, 6)]
+        recent = oldest + [{"id": 12, "article_id": 112}]
+        analyses = [{"article_id": 112, "category": "other", "importance_score": 8}]
+
+        self.assertEqual(
+            prioritize_pending_queue_rows(oldest, recent, analyses),
+            [1, 2, 3, 4, 5],
+        )
+
     def test_callbacks_include_queue_revision(self):
         markup = build_reply_markup(queue_id=42, revision=3)
         buttons = markup["inline_keyboard"][0]

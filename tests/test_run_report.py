@@ -13,15 +13,17 @@ class RunReportTests(unittest.TestCase):
             run_cost_usd="0.053856",
             starting_balance_usd="9.950000",
             spent_total_usd="7.728489",
-            remaining_estimated_usd="2.274331",
+            remaining_estimated_usd="2.221511",
         )
 
         self.assertIn("Собрано новых статей: 20", report)
         self.assertIn("Отсеяно Nano: 2", report)
         self.assertIn("Отсеяно AI: 17", report)
         self.assertIn("Передано в редакторский чат: 1", report)
-        self.assertIn("Бюджет после пополнения: $9.950000", report)
-        self.assertIn("Расход после пополнения: $7.728489", report)
+        self.assertIn("Баланс при последней сверке: $9.950000", report)
+        self.assertIn("Расход с момента сверки: $7.728489", report)
+        self.assertIn("Оценочный остаток: $2.221511", report)
+        self.assertIn("не синхронизируется автоматически", report)
         self.assertNotIn("AI calls", report)
 
     def test_only_shows_optional_operational_details_when_present(self):
@@ -36,7 +38,7 @@ class RunReportTests(unittest.TestCase):
             run_cost_usd="0.01",
             starting_balance_usd="9.95",
             spent_total_usd="1.01",
-            remaining_estimated_usd="8.99",
+            remaining_estimated_usd="8.94",
         )
 
         self.assertIn("Ошибок обработки: 1", report)

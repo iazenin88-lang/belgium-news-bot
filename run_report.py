@@ -39,8 +39,9 @@ def build_run_report(
         "",
         "💰 OpenAI",
         f"Расчётная стоимость запуска: ${run_cost_usd}",
-        f"Бюджет после пополнения: ${starting_balance_usd}",
-        f"Расход после пополнения: ${spent_total_usd}",
-        f"Расчётный остаток: ${remaining_estimated_usd}",
+        f"Баланс при последней сверке: ${starting_balance_usd}",
+        f"Расход с момента сверки: ${spent_total_usd}",
+        f"Оценочный остаток: ${remaining_estimated_usd}",
+        "Баланс не синхронизируется автоматически с OpenAI Platform.",
     ])
     return "\n".join(lines)

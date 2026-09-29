@@ -30,6 +30,9 @@ from supabase import create_client
 
 # Базовый URL Telegram Bot API
 TELEGRAM_API_BASE = "https://api.telegram.org"
+PRIORITY_CATEGORIES = {"housing", "taxes", "migration", "work"}
+NOTIFICATION_BATCH_SIZE = 5
+PRIORITY_LOOKBACK = 100
 
 
 # -------------------------------------------------------
@@ -277,12 +280,85 @@ def notify_queue_item(
         raise
 
 
+def prioritize_pending_queue_rows(
+    oldest_rows: list[dict[str, Any]],
+    recent_rows: list[dict[str, Any]],
+    analysis_rows: list[dict[str, Any]],
+    limit: int = NOTIFICATION_BATCH_SIZE,
+) -> list[int]:
+    """Give practical Belgian news a prompt slot while draining the old queue."""
+    if not oldest_rows or limit <= 0:
+        return []
+
+    scores = {int(row["article_id"]): row for row in analysis_rows}
+    oldest_id = int(oldest_rows[0]["id"])
+    selected = [oldest_id]
+    if limit == 1:
+        return selected
+
+    priority_rows = [
+        row for row in recent_rows
+        if (analysis := scores.get(int(row["article_id"])))
+        and analysis.get("category") in PRIORITY_CATEGORIES
+        and int(analysis.get("importance_score") or 0) >= 7
+    ]
+    priority_rows.sort(
+        key=lambda row: (
+            -int(scores[int(row["article_id"])]["importance_score"]),
+            int(row["id"]),
+        )
+    )
+
+    for row in priority_rows + oldest_rows:
+        queue_id = int(row["id"])
+        if queue_id not in selected:
+            selected.append(queue_id)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def select_pending_queue_ids(sb) -> list[int]:
+    oldest_rows = (
+        sb.table("editor_queue")
+        .select("id,article_id")
+        .eq("status", "pending")
+        .order("id", desc=False)
+        .limit(NOTIFICATION_BATCH_SIZE)
+        .execute()
+    ).data or []
+    if not oldest_rows:
+        return []
+
+    try:
+        recent_rows = (
+            sb.table("editor_queue")
+            .select("id,article_id")
+            .eq("status", "pending")
+            .order("id", desc=True)
+            .limit(PRIORITY_LOOKBACK)
+            .execute()
+        ).data or []
+        article_ids = list({int(row["article_id"]) for row in recent_rows})
+        analysis_rows = (
+            sb.table("article_analysis")
+            .select("article_id,category,importance_score")
+            .in_("article_id", article_ids)
+            .execute()
+        ).data or []
+        return prioritize_pending_queue_rows(oldest_rows, recent_rows, analysis_rows)
+    except Exception as error:
+        print(f"Priority lookup failed; sending oldest items: {error!r}")
+        return [int(row["id"]) for row in oldest_rows]
+
+
 # -------------------------------------------------------
 # Основная функция
 # -------------------------------------------------------
 def main():
     """
-    Отправляет максимум пять pending-кандидатов. Вызов notify_queue_item()
+    Отправляет максимум пять pending-кандидатов, сначала важные практические новости.
+    Вызов notify_queue_item()
     используется отдельным workflow для немедленного показа исправленной версии.
     """
     print("Starting notifier...")
@@ -291,21 +367,13 @@ def main():
     bot_token = get_env("TELEGRAM_BOT_TOKEN")
     chat_id = get_env("TELEGRAM_CHAT_ID")
 
-    queue_rows = (
-        sb.table("editor_queue")
-        .select("id")
-        .eq("status", "pending")
-        .order("id", desc=False)
-        .limit(5)
-        .execute()
-    ).data or []
-    print(f"Loaded pending queue items: {len(queue_rows)}")
+    queue_ids = select_pending_queue_ids(sb)
+    print(f"Selected pending queue items: {queue_ids}")
 
     sent = 0
     skipped = 0
     errors = 0
-    for row in queue_rows:
-        queue_id = int(row["id"])
+    for queue_id in queue_ids:
         try:
             if notify_queue_item(sb, bot_token, chat_id, queue_id):
                 sent += 1

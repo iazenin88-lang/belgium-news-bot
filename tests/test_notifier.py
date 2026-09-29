@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 if "requests" not in sys.modules:
@@ -14,8 +15,8 @@ import notifier
 from notifier import (
     build_message,
     build_reply_markup,
+    iter_pending_queue_ids,
     notify_queue_item,
-    prioritize_pending_queue_rows,
 )
 
 
@@ -77,42 +78,78 @@ class FakeSupabase:
         return FakeQuery(self.state, name)
 
 
-class NotifierRevisionTests(unittest.TestCase):
-    def test_practical_housing_news_bypasses_older_low_priority_items(self):
-        oldest = [{"id": i, "article_id": i + 100} for i in range(1, 6)]
-        recent = oldest + [{"id": 12, "article_id": 112}]
-        analyses = [
-            {"article_id": i + 100, "category": "other", "importance_score": 6}
-            for i in range(1, 6)
-        ] + [{"article_id": 112, "category": "housing", "importance_score": 7}]
+class FakePendingQuery:
+    def __init__(self, rows):
+        self.rows = rows
+        self.status = None
+        self.after_id = 0
+        self.page_size = None
 
-        self.assertEqual(
-            prioritize_pending_queue_rows(oldest, recent, analyses),
-            [1, 12, 2, 3, 4],
-        )
+    def select(self, _fields):
+        return self
 
-    def test_oldest_items_continue_when_priorities_fill_batch(self):
-        oldest = [{"id": i, "article_id": i + 100} for i in range(1, 6)]
-        recent = oldest + [{"id": i, "article_id": i + 100} for i in range(6, 12)]
-        analyses = [
-            {"article_id": i + 100, "category": "taxes", "importance_score": 8}
-            for i in range(6, 12)
+    def eq(self, field, value):
+        if field == "status":
+            self.status = value
+        return self
+
+    def gt(self, field, value):
+        if field == "id":
+            self.after_id = value
+        return self
+
+    def order(self, _field, desc=False):
+        return self
+
+    def limit(self, value):
+        self.page_size = value
+        return self
+
+    def execute(self):
+        rows = [
+            {"id": row["id"]} for row in self.rows
+            if row["status"] == self.status and row["id"] > self.after_id
         ]
+        return FakeResponse(rows[:self.page_size])
 
-        self.assertEqual(
-            prioritize_pending_queue_rows(oldest, recent, analyses),
-            [1, 6, 7, 8, 9],
-        )
 
-    def test_unrelated_news_does_not_jump_queue(self):
-        oldest = [{"id": i, "article_id": i + 100} for i in range(1, 6)]
-        recent = oldest + [{"id": 12, "article_id": 112}]
-        analyses = [{"article_id": 112, "category": "other", "importance_score": 8}]
+class FakePendingSupabase:
+    def __init__(self, count):
+        self.rows = [{"id": i, "status": "pending"} for i in range(1, count + 1)]
 
-        self.assertEqual(
-            prioritize_pending_queue_rows(oldest, recent, analyses),
-            [1, 2, 3, 4, 5],
-        )
+    def table(self, name):
+        assert name == "editor_queue"
+        return FakePendingQuery(self.rows)
+
+
+class NotifierRevisionTests(unittest.TestCase):
+    def test_main_sends_every_pending_item_across_pages(self):
+        sb = FakePendingSupabase(205)
+        sent_ids = []
+
+        def send(_sb, _token, _chat, queue_id):
+            sent_ids.append(queue_id)
+            sb.rows[queue_id - 1]["status"] = "sent"
+            return True
+
+        with patch.object(notifier, "get_supabase", return_value=sb), \
+             patch.object(notifier, "get_env", return_value="test"), \
+             patch.object(notifier, "notify_queue_item", side_effect=send), \
+             patch.object(notifier.time, "sleep") as sleep:
+            notifier.main()
+
+        self.assertEqual(sent_ids, list(range(1, 206)))
+        self.assertEqual(sleep.call_count, 205)
+
+    def test_pending_iterator_leaves_failed_item_for_next_run(self):
+        sb = FakePendingSupabase(3)
+        with patch.object(notifier, "PENDING_PAGE_SIZE", 2):
+            iterator = iter_pending_queue_ids(sb)
+            self.assertEqual(next(iterator), 1)
+            sb.rows[0]["status"] = "sent"
+            self.assertEqual(next(iterator), 2)
+            self.assertEqual(list(iterator), [3])
+        self.assertEqual(sb.rows[1]["status"], "pending")
 
     def test_callbacks_include_queue_revision(self):
         markup = build_reply_markup(queue_id=42, revision=3)

@@ -122,11 +122,23 @@ async function answerCallbackQuery(
   text?: string,
   showAlert = false,
 ) {
-  await telegram("answerCallbackQuery", {
-    callback_query_id: callbackQueryId,
-    text,
-    show_alert: showAlert,
-  });
+  try {
+    await telegram("answerCallbackQuery", {
+      callback_query_id: callbackQueryId,
+      text,
+      show_alert: showAlert,
+    });
+  } catch (error) {
+    // Telegram callbacks expire quickly. A failed acknowledgement must not
+    // cause Telegram to retry an already-applied editorial action.
+    const message = String(error);
+    if (message.includes("query is too old") ||
+        message.includes("query ID is invalid")) {
+      console.warn("Expired Telegram callback acknowledgement:", message);
+      return;
+    }
+    throw error;
+  }
 }
 
 async function editMessageReplyMarkup(
@@ -479,6 +491,7 @@ async function countRemainingCandidates(chatId: number): Promise<number> {
 async function findNextSentCandidate(
   chatId: number,
   cursorMessageId: number,
+  excludeQueueId?: number,
 ): Promise<QueueRow | null> {
   const fields =
     "id,article_id,status,revision,telegram_chat_id,telegram_message_id";
@@ -487,6 +500,7 @@ async function findNextSentCandidate(
     .select(fields)
     .eq("status", "sent")
     .eq("telegram_chat_id", chatId)
+    .neq("id", excludeQueueId ?? -1)
     .gt("telegram_message_id", cursorMessageId)
     .order("telegram_message_id", { ascending: true })
     .order("id", { ascending: true })
@@ -503,6 +517,7 @@ async function findNextSentCandidate(
     .select(fields)
     .eq("status", "sent")
     .eq("telegram_chat_id", chatId)
+    .neq("id", excludeQueueId ?? -1)
     .lt("telegram_message_id", cursorMessageId)
     .order("telegram_message_id", { ascending: false })
     .order("id", { ascending: false })
@@ -648,12 +663,13 @@ type NextCandidateResult =
 async function sendNextCandidate(
   chatId: number,
   cursorMessageId: number,
+  excludeQueueId?: number,
 ): Promise<NextCandidateResult> {
   const remainingCount = await countRemainingCandidates(chatId);
   // The card itself is already being shown to the editor.  The counter must
   // describe only the candidates that will remain after this one.
   const remainingAfterCurrent = Math.max(remainingCount - 1, 0);
-  const sentCandidate = await findNextSentCandidate(chatId, cursorMessageId);
+  const sentCandidate = await findNextSentCandidate(chatId, cursorMessageId, excludeQueueId);
   if (sentCandidate) {
     const previousMessageId = sentCandidate.telegram_message_id;
     if (previousMessageId === null) return { kind: "busy" };
@@ -1029,8 +1045,8 @@ async function handleNextCandidate(
     await answerCallbackQuery(callbackId, "Это старая версия новости", true);
     return;
   }
-  const cursorMessageId = queue.telegram_message_id;
-  if (cursorMessageId === null) {
+  const cursorMessageId = messageId;
+  if (queue.telegram_message_id === null) {
     await answerCallbackQuery(
       callbackId,
       "Для этой новости нет позиции в очереди",
@@ -1051,7 +1067,7 @@ async function handleNextCandidate(
 
   let result: NextCandidateResult;
   try {
-    result = await sendNextCandidate(chatId, cursorMessageId);
+    result = await sendNextCandidate(chatId, cursorMessageId, queue.id);
   } catch (error) {
     console.error("Opening the next candidate failed:", error);
     try {

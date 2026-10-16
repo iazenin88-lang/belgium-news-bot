@@ -1,0 +1,20 @@
+name: Telegram webhook regression tests
+
+on:
+  pull_request:
+    paths:
+      - "supabase/functions/telegram-webhook/index.ts"
+      - "tests/telegram-webhook.test.cjs"
+      - ".github/workflows/telegram_webhook_tests.yml"
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install --no-save --no-package-lock typescript@5
+      - run: node --test tests/telegram-webhook.test.cjs
